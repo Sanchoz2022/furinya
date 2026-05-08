@@ -190,7 +190,7 @@ AppBase::AppBase(APath workingDir): mDiary(workingDir / "diary"), mWakeupTimer(_
                                     }
                                     break;
                                 }
-                                if (diary.length() > config::DIARY_INJECTION_MAX_LENGTH) {
+                                if (diary.length() >= config::DIARY_INJECTION_MAX_LENGTH) {
                                     // set the minimum constraint for the future queries
                                     self.mRelevanceThreshold = relatedness;
                                     break;
