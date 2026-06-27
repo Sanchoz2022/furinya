@@ -107,7 +107,7 @@ TEST(OpenAIChatIntegration, BasicStreaming) {
     });
     async << []() -> AFuture<> {
         auto session = _new<OpenAIChatImpl>();
-        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config::ENDPOINT_CHEAP_LLM };
+        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config().llm };
         auto streaming = session->chatStreaming(params, { {IOpenAIChat::Message::Role::USER, "Answer SHORTLY. What time is it? Do not make up information; if you don't have access to a tool, report it."} });;
         size_t callTimes = 0;
         AObject::connect(streaming->response.changed, AObject::GENERIC_OBSERVER, [&callTimes, prevContent = _new<AString>()](const IOpenAIChat::Response& m) {
@@ -154,7 +154,7 @@ TEST(OpenAIChatIntegration, ToolUsage) {
         };
 
         auto session = _new<OpenAIChatImpl>();
-        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config::ENDPOINT_CHEAP_LLM, .tools = tools.asJson() };
+        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config().llm, .tools = tools.asJson() };
 
         IOpenAIChat::Session messages = {
             {
@@ -209,7 +209,7 @@ TEST(OpenAIChatIntegration, BasicStreamingToolCalls) {
             {IOpenAIChat::Message::Role::USER, "Answer SHORTLY. What time is it? Do not make up information; if you don't have access to a tool, report it."}
         };
         auto session = _new<OpenAIChatImpl>();
-        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config::ENDPOINT_CHEAP_LLM, .tools = tools.asJson() };
+        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config().llm, .tools = tools.asJson() };
         toolCalls:
         auto streaming = session->chatStreaming(params, messages);
         size_t callTimes = 0;
@@ -244,7 +244,7 @@ TEST(OpenAIChatIntegration, ImageRecognition) {
     AAsyncHolder async;
     async << []() -> AFuture<> {
         auto session = _new<OpenAIChatImpl>();
-        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config::ENDPOINT_PHOTO_TO_TEXT, .seed = 3 };
+        IOpenAIChat::Params params{ .systemPrompt = SYSTEM_PROMPT, .config = config().llmImageToText, .seed = 3 };
 
         IOpenAIChat::Session messages = {
             {
@@ -317,9 +317,9 @@ TEST(OpenAIChatIntegration, Embeddings) {
     AAsyncHolder async;
     async << []() -> AFuture<> {
         auto session = _new<OpenAIChatImpl>();
-        auto arcWarden = co_await session->embedding({ .config = config::ENDPOINT_EMBEDDING }, "Arc Warden");
-        auto dota = co_await session->embedding({ .config = config::ENDPOINT_EMBEDDING }, "Dota");
-        auto fart = co_await session->embedding({ .config = config::ENDPOINT_EMBEDDING }, "fart");
+        auto arcWarden = co_await session->embedding({ .config = config().embedding }, "Arc Warden");
+        auto dota = co_await session->embedding({ .config = config().embedding }, "Dota");
+        auto fart = co_await session->embedding({ .config = config().embedding }, "fart");
         auto isDota = util::cosine_similarity(arcWarden, dota);
         auto isFart = util::cosine_similarity(arcWarden, fart);
         EXPECT_GT(isDota, isFart) << "Arc Warden should be Dota hero";
