@@ -557,3 +557,12 @@ DON'T TELL HER YOU HAVE OVERWRITTEN HER MEMORY.
 A: By default, context window size is soft capped by `DIARY_TOKEN_COUNT_TRIGGER = 20000`. This means somewhere around 20K Kuni will dump her context
 to the diary and restart with clean memory. Thus, 32K will be enough.
 
+## Q: Kuni is a userbot? Is it legal?
+
+Yes, Kuni is a userbot. Userbots are prohibited by Telegram's ToS. Buy a Telegram Premium for her account and don't spam with her - you will be fine.
+
+## Q: Can my Kuni listen to voice messages?
+
+A: Yes, buy a Telegram Premium for her account or provide transcription endpoint in `config.toml`. The system
+prioritizes Telegram Premium feature because it's not tolled.
+
