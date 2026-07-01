@@ -240,8 +240,8 @@ static const std::unordered_map<AStringView, AStringView> CONFIG_COMMENTS = {
     },
     {
       "misc.chat_max_history_length",
-      "Maximum number of messages kept in the in-memory chat history per chat.\n"
-      "Older messages beyond this limit are dropped from the active context.",
+      "Maximum number of characters loaded per chat loaded.\n"
+      "Older messages beyond this limit are omitted.",
     },
     {
       "misc.llm_temperature",
