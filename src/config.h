@@ -33,16 +33,20 @@
   X(float, antiRepeatTriggerMax, 0.95, "misc.anti_repeat_trigger_max") \
   X(float, antiRepeatTriggerAvg, 0.85, "misc.anti_repeat_trigger_avg") \
   X(size_t, antiRepeatMaxHistory, 32, "misc.anti_repeat_max_history") \
+  X(std::chrono::seconds, requestTimeoutSecs, std::chrono::seconds(30), "misc.request_timeout_secs") \
+  X(size_t, videoMaxFrames, 16, "misc.video_max_frames") \
+  X(size_t, videoMinStepMs, 1000, "misc.video_min_step_ms") \
   X(bool, capabilityWebSearch, false, "capabilities.web_search.enabled") \
   X(AString, webSearchOllamaKey, "", "capabilities.web_search.ollama_bearer_key") \
   X(bool, capabilityVision, false, "capabilities.vision.enabled") \
   X(EndpointAndModel, llmImageToText, (EndpointAndModel{.endpoint={"http://localhost:11434/v1/"},.model="qwen3.5:9b"}), "capabilities.vision.llm_image_to_text") \
+  X(EndpointAndModel, llmImageToTextCheap, (EndpointAndModel{.endpoint={"http://localhost:11434/v1/"},.model="ministral-3:8b"}), "capabilities.vision.llm_image_to_text_cheap") \
   X(bool, capabilityUseStickers, false, "capabilities.use_stickers.enabled") \
   X(bool, capabilityTakePhoto, false, "capabilities.take_photo.enabled") \
   X(Endpoint, sdEndpoint, (Endpoint{.baseUrl="http://localhost:7860/"}),"capabilities.take_photo.sd.endpoint") \
   X(AString, sdCheckpoint, "novaAnimeXL_ilV170.safetensors", "capabilities.take_photo.sd.checkpoint") \
   X(bool, capabilityHearing, false, "capabilities.hearing.enabled") \
-  X(EndpointAndModel, llmAudioToText, (EndpointAndModel{.endpoint={"http://localhost:11434/v1/"},.model="openai/gpt-4o-mini-transcribe"}), "capabilities.hearing.llm_audio_to_text") \
+  X(EndpointAndModel, llmAudioToText, (EndpointAndModel{.endpoint={"http://localhost:9000/v1/"},.model="base"}), "capabilities.hearing.llm_audio_to_text") \
   X(bool, capabilityRecordVoice, false, "capabilities.record_voice.enabled") \
   X(::Config::TTSBackend, recordVoiceBackend, ::Config::TTSBackend::ELEVENLABS, "capabilities.record_voice.backend") \
   X(AString, recordVoiceElevenLabsKey, "", "capabilities.record_voice.elevenlabs.key") \
@@ -57,7 +61,6 @@
 
 struct Config {
     // these are technical constants that are not interesting for consumers
-    static constexpr auto REQUEST_TIMEOUT = std::chrono::seconds(30);
     static constexpr auto SLEEP_MAX_TIME = std::chrono::hours(6);
 
     enum class LockdownMode {
