@@ -15,6 +15,7 @@ struct Prompts {
     AString diarySave;
     AString sleepConsolidator;
     AString recordAudioSpeech;
+    AString messagesEpilogue;
 };
 
 const Prompts& prompts();
