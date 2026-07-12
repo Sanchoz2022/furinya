@@ -301,17 +301,17 @@ OpenAITools::Tool tools::sendTelegramMessage(
                 }
                 // random wait. You definitely don't want to receive 4 large messages in 1 sec right?
                 static std::default_random_engine re(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-                static constexpr auto MIN_WPM = 120;
-                static constexpr auto MAX_WPM = 150;
+                const auto minWpm = config().typingSimulationMinWpm;
+                const auto maxWpm = config().typingSimulationMaxWpm;
                 static constexpr auto wpmToPerCharacterMillis = [](auto wordsPerMinute) {
                     const auto charactersPerMinute = wordsPerMinute * 5;
                     const auto charactersPerSecond = charactersPerMinute / 60;
                     const auto millisecondsPerCharacter = 1000 / charactersPerSecond;
                     return millisecondsPerCharacter;
                 };
-                static constexpr auto MIN_DELAY = wpmToPerCharacterMillis(MIN_WPM);
-                static constexpr auto MAX_DELAY = wpmToPerCharacterMillis(MAX_WPM);
-                static std::uniform_int_distribution<int> dist(MAX_DELAY, MIN_DELAY);
+                const auto minDelay = wpmToPerCharacterMillis(minWpm);
+                const auto maxDelay = wpmToPerCharacterMillis(maxWpm);
+                std::uniform_int_distribution<int> dist(maxDelay, minDelay);
                 const auto delay = (messageLength + 1) * dist(re) * 1ms;
                 ALogger::info("send_telegram_message") << "Synthetic typing delay: " << delay.count() << "ms";
                 co_await AThread::asyncSleep(delay);
@@ -354,13 +354,13 @@ OpenAITools::Tool tools::sendTelegramMessage(
                                                        std::exchange(photo, {}),
                                                        std::exchange(audioPath, {}),
                                                        replyTo);
-                    result += "Message sent successfully to \"{}\"; message_id={}, text=\"{}\".\n"_format(chat->title_, sent->id_, llmui::extractMessageTypeAndText(*sent));
+                    result += "Message sent successfully to \"{}\"; message_id={}\n"_format(chat->title_, sent->id_);
                 }
             } else {
                 co_await simulateTypingDelay(message.length());
                 auto sent = co_await util::telegramPostMessage(
                     *telegram, chat->id_, message, std::move(photo), std::move(audioPath), replyTo);
-                result += "Message sent successfully to \"{}\"; message_id={}, text=\"{}\"."_format(chat->title_, sent->id_, llmui::extractMessageTypeAndText(*sent));
+                result += "Message sent successfully to \"{}\"; message_id={}."_format(chat->title_, sent->id_);
             }
 
 

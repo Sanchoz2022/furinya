@@ -370,10 +370,24 @@ static const std::unordered_map<AStringView, AStringView> CONFIG_COMMENTS = {
       "When enabled, Kuni exposes an API endpoint that forwards requests through her LLM,\n"
       "allowing external tools (e.g. VS Code Copilot) to use Kuni as a model backend.",
     },
+    { "misc.remind_use_ask",
+      "Remind to use #ask tool (main RAG fetch) more proactively.\n"
+      "Some LLMs forget about using this. If true, the system inserts reminders if LLM doesn't use #ask." },
     {
-        "misc.remind_use_ask",
-        "Remind to use #ask tool (main RAG fetch) more proactively.\n"
-        "Some LLMs forget about using this. If true, the system inserts reminders if LLM doesn't use #ask."
+      "misc.typing_simulation_min_wpm",
+      "Minimum simulated typing speed (words per minute) used to delay sending consecutive messages.\n"
+      "Lower values make Kuni appear to type slower (bigger delay).",
+    },
+    {
+      "misc.typing_simulation_max_wpm",
+      "Maximum simulated typing speed (words per minute) used to delay sending consecutive messages.\n"
+      "Higher values make Kuni appear to type faster (smaller delay).",
+    },
+    {
+      "misc.check_chats_on_startup",
+      "If set to true, Kuni will put all unread chats to queue on program startup.\n"
+      "If set to false, Kuni will check chats if notification was received during program runtime.\n"
+      "LLM is still able to call get_telegram_chats and iterate through them \"manually\"",
     },
 };
 

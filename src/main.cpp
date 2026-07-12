@@ -237,6 +237,9 @@ private:
     }
 
     AFuture<> sendNotificationsOnInit() {
+        if (!config().checkChatsOnStartup) {
+            co_return;
+        }
         // tdlib does not send notifications for unread chats on program startup. we'll fix this.
         auto chats = co_await getChats();
         chats |= ranges::actions::reverse;   // older first, newest last
@@ -417,16 +420,18 @@ public:
             int64_t fromMessage = 0;
             for (;;) {
                 auto response = co_await mTelegram->sendQueryWithResult(
-                    ITelegramClient::toPtr(td::td_api::getChatHistory(chatId, fromMessage, 0, 5, false)));
+                    ITelegramClient::toPtr(td::td_api::getChatHistory(chatId, fromMessage, 0, 30, false)));
                 if (response->messages_.empty()) {
                     break;
                 }
                 fromMessage = response->messages_.back()->id_;
+                size_t length = 0;
                 for (auto& msg : response->messages_) {
 #if AUI_DEBUG
                     AUI_ASSERT(!ranges::any_of(messages, [&](const auto& m) { return m->id_ == msg->id_; }));
 #endif
                     const auto msgFormatting = R"(<message message_id="{}")"_format(msg->id_);
+                    length += to_string(msg->content_).length();
                     messages.push_back(std::move(msg));
                     if (ranges::any_of(temporaryContext(), [&](const IOpenAIChat::Message& msg) {
                             return msg.content.contains(msgFormatting);
@@ -436,13 +441,12 @@ public:
                         // detached, and stop at this point.
                         co_return;
                     }
-                }
-                const auto length = ranges::accumulate(
-                    messages, size_t(0), std::plus {}, [](const td::td_api::object_ptr<td::td_api::message>& msg) {
-                        return to_string(msg->content_).length();
-                    });
-                if (length >= config().chatMaxHistoryLength) {
-                    break;
+                    if (messages.size() < 3) {
+                        continue;
+                    }
+                    if (length >= config().chatMaxHistoryLength) {
+                        co_return;
+                    }
                 }
             }
         }();
@@ -490,9 +494,7 @@ public:
             // goto naxyi;
         }
         {
-            td::td_api::array<td::td_api::int53> readMessages;
             for (auto& msg : messages | ranges::view::reverse) {
-                readMessages.push_back(msg->id_);
                 auto msgFormatted =
                     co_await llmui::formatChatHistoryMessage(*telegram(), *msg, *chat, *openAI(), temporaryContext());
                 for (const auto& i : chatHistoryMessageProcessors) {
@@ -546,8 +548,10 @@ public:
                 }
             }
 
-            mTelegram->sendQuery(
-                ITelegramClient::toPtr(td::td_api::viewMessages(chatId, std::move(readMessages), nullptr, false)));
+            if (!messages.empty()) {
+                mTelegram->sendQuery(
+                    ITelegramClient::toPtr(td::td_api::viewMessages(chatId, td::td_api::array<td::td_api::int53>{messages.front()->id_}, nullptr, true)));
+            }
 
             result = "You switched to the chat \"{}\" in Telegram. You see last messages:\n"_format(chat->title_) + result;
 
