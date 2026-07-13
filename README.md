@@ -158,6 +158,13 @@ sudo apt install pkg-config libfontconfig-dev libxcursor-dev libxi-dev libxrandr
 sudo dnf install fontconfig-devel libXi libglvnd-devel libstdc++-static glew-devel pulseaudio-libs-devel libepoxy-devel gperf
 ```
 
+### macOS (Apple Silicon)
+*File hot-reloading (config/prompts) is fully supported on macOS natively using Apple's FSEvents API.*
+
+```bash
+brew install llvm cmake ninja pkg-config ffmpeg openssl@3
+```
+
 ## Setup Instructions
 
 ### 1. Ollama Model Setup
@@ -185,11 +192,30 @@ docker compose up -d
 
 ### Build Steps
 
+#### Linux & WSL
 ```bash
 # Configure with CMake (from project root)
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 # Build the project
+cmake --build build
+```
+
+#### macOS
+```bash
+# 1. Force CMake to use Homebrew's LLVM Clang
+export CC=$(brew --prefix llvm)/bin/clang
+export CXX=$(brew --prefix llvm)/bin/clang++
+export LDFLAGS="-L$(brew --prefix llvm)/lib/c++ -Wl,-rpath,$(brew --prefix llvm)/lib/c++"
+
+# 2. Configure with Homebrew prefixes
+cmake -G Ninja -B build \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DKUNI_USE_FFMPEG=ON \
+  -DCMAKE_PREFIX_PATH=$(brew --prefix) \
+  -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+# 3. Build the main bot target
 cmake --build build
 ```
 
