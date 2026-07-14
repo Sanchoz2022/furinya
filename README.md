@@ -158,6 +158,13 @@ sudo apt install pkg-config libfontconfig-dev libxcursor-dev libxi-dev libxrandr
 sudo dnf install fontconfig-devel libXi libglvnd-devel libstdc++-static glew-devel pulseaudio-libs-devel libepoxy-devel gperf
 ```
 
+### macOS (Apple Silicon)
+*File hot-reloading (config/prompts) is fully supported on macOS natively using Apple's FSEvents API.*
+
+```bash
+brew install llvm cmake ninja pkg-config ffmpeg openssl@3
+```
+
 ## Setup Instructions
 
 ### 1. Ollama Model Setup
@@ -185,11 +192,30 @@ docker compose up -d
 
 ### Build Steps
 
+#### Linux & WSL
 ```bash
 # Configure with CMake (from project root)
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 # Build the project
+cmake --build build
+```
+
+#### macOS
+```bash
+# 1. Force CMake to use Homebrew's LLVM Clang
+export CC=$(brew --prefix llvm)/bin/clang
+export CXX=$(brew --prefix llvm)/bin/clang++
+export LDFLAGS="-L$(brew --prefix llvm)/lib/c++ -Wl,-rpath,$(brew --prefix llvm)/lib/c++"
+
+# 2. Configure with Homebrew prefixes
+cmake -G Ninja -B build \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DKUNI_USE_FFMPEG=ON \
+  -DCMAKE_PREFIX_PATH=$(brew --prefix) \
+  -DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)
+
+# 3. Build the main bot target
 cmake --build build
 ```
 
@@ -230,6 +256,7 @@ Open it and populate at minimum the `[general]` section:
 ```toml
 [general]
 character_name = "Kuni"          # your character's name
+telegram_enabled = true          # set to false to run as a standalone proxy without Telegram
 character_nickname = "@kunii_chan"
 papik_name = "Alex2772"          # your nickname — the instance owner
 papik_chat_id = 625207005        # your Telegram user ID
@@ -392,6 +419,10 @@ Client  ──POST /v1/chat/completions──►  Proxy
 ### Configuration
 
 Enable `PROXY_ENABLED` in config.
+
+#### Standalone mode (No Telegram)
+
+If you just want to use Kuni as a local RAG proxy for your IDE without dealing with Telegram accounts, set `telegram_enabled = false` in `config.toml`. Kuni will bypass TDLib initialization and spin up the proxy server directly on port 10434. 
 
 #### VS Code GitHub Copilot.
 

@@ -4,7 +4,7 @@
 
 #include "AUI/IO/APath.h"
 #include "AUI/Logging/ALogger.h"
-#include "AUI/Platform/linux/AINotifyFileWatcher.h"
+#include "util/FileWatcher.h"
 #include "AUI/Platform/unix/UnixIoThread.h"
 #include "AUI/Util/kAUI.h"
 
@@ -132,6 +132,11 @@ static const std::unordered_map<AStringView, AStringView> CONFIG_COMMENTS = {
       "https://core.telegram.org/api/obtaining_api_id\n"
       "Если ты русский и получаешь ошибку ERROR, смотри\n"
       "https://habr.com/ru/articles/923168/",
+    },
+    {
+      "general.telegram_enabled",
+      "Whether to enable the Telegram bot. If set to false, Kuni will run in standalone mode\n"
+      "(useful if you only want to use the proxy server without a Telegram account).",
     },
     {
       "general.telegram_api_hash",
@@ -365,6 +370,25 @@ static const std::unordered_map<AStringView, AStringView> CONFIG_COMMENTS = {
       "When enabled, Kuni exposes an API endpoint that forwards requests through her LLM,\n"
       "allowing external tools (e.g. VS Code Copilot) to use Kuni as a model backend.",
     },
+    { "misc.remind_use_ask",
+      "Remind to use #ask tool (main RAG fetch) more proactively.\n"
+      "Some LLMs forget about using this. If true, the system inserts reminders if LLM doesn't use #ask." },
+    {
+      "misc.typing_simulation_min_wpm",
+      "Minimum simulated typing speed (words per minute) used to delay sending consecutive messages.\n"
+      "Lower values make Kuni appear to type slower (bigger delay).",
+    },
+    {
+      "misc.typing_simulation_max_wpm",
+      "Maximum simulated typing speed (words per minute) used to delay sending consecutive messages.\n"
+      "Higher values make Kuni appear to type faster (smaller delay).",
+    },
+    {
+      "misc.check_chats_on_startup",
+      "If set to true, Kuni will put all unread chats to queue on program startup.\n"
+      "If set to false, Kuni will check chats if notification was received during program runtime.\n"
+      "LLM is still able to call get_telegram_chats and iterate through them \"manually\"",
+    },
 };
 
 static constexpr auto CONFIG_TOML = "config.toml";
@@ -526,8 +550,9 @@ static Config load(bool saveBack = false) {
 
 #ifndef AUI_TESTS_MODULE
     // validation
-    {
-        const auto& value = toml["general"]["telegram_api_id"];
+    if (out.telegramEnabled) {
+        {
+            const auto& value = toml["general"]["telegram_api_id"];
         if (value.as_integer() == 0) {
             ALogger::err(LOG_TAG) << toml::format_error(
                 (toml::make_error_info("general.telegram_api_id should be populated", value, "the actual value is 0")));
@@ -542,6 +567,7 @@ static Config load(bool saveBack = false) {
             std::exit(-1);
         }
     }
+    }
 #endif
     ALogger::info(LOG_TAG) << CONFIG_TOML << " loaded";
     return out;
@@ -552,9 +578,9 @@ emits<> gConfigUpdated;
 const Config& config() {
     static Config cfg = load(true);
     AUI_DO_ONCE {
-        static auto watcher = _new<AINotifyFileWatcher>();
-        auto h = watcher->addWatch(APath(CONFIG_TOML).absolute(), AINotifyFileWatcher::Mask::MODIFY);
-        AObject::connect(watcher->fired, AObject::GENERIC_OBSERVER, [h](const AINotifyFileWatcher::Event& event) {
+        static auto watcher = _new<util::FileWatcher>();
+        auto h = watcher->addWatch(APath(CONFIG_TOML).absolute(), util::FileWatcher::Mask::MODIFY);
+        AObject::connect(watcher->fired, AObject::GENERIC_OBSERVER, [h](const util::FileWatcher::Event& event) {
             if (event.watchDescriptor != h) {
                 return;
             }
