@@ -3,3 +3,7 @@ cmake-build-**
 *uild*
 .DS_Store
 bin
+id_ed25519*
+*.pub
+/git
+/git.pub
