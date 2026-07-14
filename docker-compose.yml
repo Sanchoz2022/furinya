@@ -1,13 +1,49 @@
 services:
-  ollama:
-    image: ollama/ollama:0.20.6
+  llama-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.llama
+    container_name: kuni-llama-server
+    restart: unless-stopped
+    network_mode: host
     volumes:
-      - ./bin/ollama:/root/.ollama
-      - ./ollama_setup.sh:/ollama_setup.sh
-    ports:
-      - "11434:11434"
-    restart: always
-    entrypoint: [ "/usr/bin/bash", "/ollama_setup.sh" ]
+      - ./bin/llama/models:/models:ro
+    # Запуск Gemma 4 E2B на GPU с её родным мультимодальным проектором и контекстом 16K
+    command: >
+      /app/llama.cpp/build/bin/llama-server 
+      -m /models/Gemma-4-E4B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf 
+      --mmproj /models/mmproj-gemma-4-E4B-q8_0.gguf
+      -c 32768 
+      -np 1 
+      --embedding 
+      --pooling mean
+      --port 8090 
+      --host 0.0.0.0 
+      -ngl 99 
+      -fa on 
+      -t 8 
+      -tb 8
+      --cache-type-k q4_0
+      --cache-type-v q4_0
+      --batch-size 4096
+      --ubatch-size 4096
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+  whisper:
+    image: hwdsl2/whisper-server:cuda
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./bin/whisper:/var/lib/whisper
+    environment:
+      - WHISPER_API_KEY=
+      - WHISPER_MODEL=large-v3-turbo
     deploy:
       resources:
         reservations:
@@ -18,11 +54,11 @@ services:
 
   sd:
     image: universonic/stable-diffusion-webui:full
-    command: --medvram --api
-#    command: --lowvram --api # replace with this if your PC is a potato
+    container_name: kuni-sd
     restart: always
-    ports:
-      - "7860:8080/tcp"
+    network_mode: host
+    # Запуск SD на GPU с оптимизацией памяти --medvram и ускорением xformers
+    command: --medvram --xformers --api --port 7860
     volumes:
       - ./bin/sd/inputs:/app/stable-diffusion-webui/inputs
       - ./bin/sd/textual_inversion_templates:/app/stable-diffusion-webui/textual_inversion_templates
@@ -36,107 +72,9 @@ services:
     cap_add:
       - NET_BIND_SERVICE
     deploy:
-      mode: global
-      placement:
-        constraints:
-          - "node.labels.iface != extern"
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-
-  whisper:
-    image: hwdsl2/whisper-server:cuda
-    restart: always
-    ports:
-      - "9000:9000"
-    volumes:
-      - ./bin/whisper:/var/lib/whisper
-    environment:
-#      - WHISPER_DEVICE=cuda
-      - WHISPER_API_KEY=
-      - WHISPER_MODEL=large-v3-turbo
-    deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
               capabilities: [ gpu ]
-
-  omnivoice-server:
-    # https://github.com/maemreyo/omnivoice-server
-    # you need to build this first
-    image: omnivoice-server
-    pull_policy: never # only use local image
-    container_name: omnivoice-server
-    ports:
-      - "8880:8880"
-    volumes:
-      # Persist voice profiles
-      - ./bin/omnivoice/profiles:/home/ubuntu/app/profiles
-      - ./bin/omnivoice/huggingface:/home/ubuntu/.cache/huggingface # persist HF cache for offline use
-    environment:
-      # Server configuration
-      - OMNIVOICE_HOST=0.0.0.0
-      - OMNIVOICE_PORT=6020
-      - OMNIVOICE_DEVICE=cuda
-      - OMNIVOICE_NUM_STEP=32
-      - OMNIVOICE_MAX_CONCURRENT=2
-      # HF_HUB_OFFLINE=1  # enables server in a no Internet docker config
-      # Optional: Enable authentication
-      # - OMNIVOICE_API_KEY=your-secret-key
-      # Optional: Adjust inference quality
-      # - OMNIVOICE_GUIDANCE_SCALE=2.0
-      # - OMNIVOICE_DENOISE=true
-      # Optional: Logging
-      - OMNIVOICE_LOG_LEVEL=info
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8880/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-
-# uncomment below if you want a dashboard with stats
-#
-#  prometheus:
-#    image: prom/prometheus:latest
-#    volumes:
-#      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-#      - ./bin/prometheus/data:/prometheus
-#    ports:
-#      - "9090:9090"
-#    restart: always
-#    command:
-#      - '--config.file=/etc/prometheus/prometheus.yml'
-#      - '--storage.tsdb.path=/prometheus'
-##      - '--web.enable-admin-api'
-#    extra_hosts:
-#      - "host.docker.internal:host-gateway"
-#
-#  grafana:
-#    image: grafana/grafana:latest
-#    volumes:
-#      - ./bin/grafana/data:/var/lib/grafana
-#      - ./grafana/dashboards:/var/lib/grafana/dashboards
-#      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/main.yaml
-#      - ./grafana/datasources:/etc/grafana/provisioning/datasources
-#    ports:
-#      - "3000:3000"
-#    restart: always
-#    depends_on:
-#      - prometheus
-#    environment:
-#      - GF_SECURITY_ADMIN_USER=admin
-#      - GF_SECURITY_ADMIN_PASSWORD=admin # IMPORTANT: change this
-#      - GF_USERS_ALLOW_SIGN_UP=false
