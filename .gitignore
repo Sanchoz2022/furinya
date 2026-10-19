@@ -1,0 +1,18 @@
+/target
+/data/
+*.log
+furinya.log
+config.toml
+*.sqlite*
+*.binlog
+# Локальные промпты не попадают в удалённый репозиторий (могут содержать
+# персональные инструкции/секреты). Если нужно — добавь prompts/ в репо вручную.
+prompts/
+# TDLib json-lib 792MB — в git не попадает
+libs/
+.opencode/
+logs/
+tdlib/db.sqlite*
+tdlib/td.binlog
+temp_*.jpg
+nohup.out

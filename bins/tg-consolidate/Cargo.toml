@@ -1,0 +1,15 @@
+[package]
+name = "tg-consolidate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+furinya-core = { path = "../../crates/furinya-core" }
+furinya-llm = { path = "../../crates/furinya-llm" }
+furinya-diary = { path = "../../crates/furinya-diary" }
+furinya-tg = { path = "../../crates/furinya-tg" }
+anyhow = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tokio = { version = "1", features = ["full"] }

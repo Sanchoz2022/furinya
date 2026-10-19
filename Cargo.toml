@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/furinya-core",
+    "crates/furinya-llm",
+    "crates/furinya-diary",
+    "crates/furinya-tg",
+    "crates/furinya-vision",
+    "crates/furinya-audio",
+    "crates/furinya-sd",
+    "bins/furinya",
+    "bins/tg-history-inspect",
+    "bins/tg-consolidate",
+    "bins/file-consolidate",
+    "bins/memory-build",
+]
+default-members = ["crates/furinya-core", "crates/furinya-llm", "crates/furinya-diary", "crates/furinya-tg", "bins/furinya"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.97"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 256

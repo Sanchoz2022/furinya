@@ -1,0 +1,22 @@
+[package]
+name = "furinya"
+edition = "2024"
+version.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "furinya"
+path = "src/main.rs"
+
+[dependencies]
+furinya-core = { path = "../../crates/furinya-core" }
+furinya-llm = { path = "../../crates/furinya-llm" }
+furinya-diary = { path = "../../crates/furinya-diary" }
+furinya-tg = { path = "../../crates/furinya-tg" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "std"] }
+anyhow = "1"
+libc = "0.2"
+chrono = "0.4"

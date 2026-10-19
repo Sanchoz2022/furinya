@@ -1,0 +1,52 @@
+# furinya — пример конфига. РЕАЛЬНЫЙ config.toml в репо НЕ попадает.
+# Ключи API хранятся только в переменных окружения (см. README).
+
+[general]
+telegram_api_id = 0
+telegram_api_hash = ""
+telegram_my_id = 8337379413
+character_name = "Furinya"
+papik_chat_id = 5005580127
+papik_name = "Александр"
+tg_history_load_limit = 400
+tg_recent_limit = 20
+
+[general.llm]
+# Mistral API: primary 8b (625k TPM / 3.13 RPS), fallback 14b (937k TPM / 0.5 RPS)
+endpoint.baseUrl = "https://api.mistral.ai/v1/"
+endpoint.model = "ministral-8b-2512"
+endpoint.fallback_model = "ministral-14b-2512"
+
+[general.embedding]
+# Mistral embeddings (1024-мера), RAG-память
+endpoint.baseUrl = "https://api.mistral.ai/v1/"
+model = "mistral-embed-2312"
+
+[capabilities.vision.llm_image_to_text]
+# Vision: ministral multimodal (проверено; medium/small у нас 429)
+model = "ministral-14b-2512"
+max_dim = 1280
+jpeg_quality = 80
+
+[capabilities.record_voice]
+enabled = true
+backend = "fish"
+fish.referenceId = "abe4d08bf8014568a761f99b946e78ac"
+
+[capabilities.take_photo]
+enabled = true
+# backends: "sd" — наш локальный sd-server; "aihorde" — облачный fallback
+backend = "sd"
+sd.baseUrl = "http://192.168.1.172:8082/"
+
+[capabilities.take_photo.aihorde]
+apikey = ""
+models = ["waifu_diffusion"]
+nsfw = true
+
+[misc]
+idle_message_timeout_secs = 300
+sleep_timeout_secs = 900
+diary_dir = "data/diary"
+diary_keep_last = 20
+active_top_k = 6

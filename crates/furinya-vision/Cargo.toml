@@ -1,0 +1,16 @@
+[package]
+name = "furinya-vision"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[dependencies]
+furinya-core = { path = "../furinya-core" }
+furinya-llm = { path = "../furinya-llm" }
+anyhow = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
