@@ -1,0 +1,83 @@
+# options: https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+BasedOnStyle: Google
+IndentWidth: 4
+ColumnLimit: 120
+# does (int) x instead of (int)x
+SpaceAfterCStyleCast: true
+# spaces, not tabs!
+UseTab: Never
+# if (x) doStuff()  is not allowed, bad style
+AllowShortIfStatementsOnASingleLine: false
+AlignTrailingComments: true
+SpacesBeforeTrailingComments: 3
+AlignConsecutiveMacros: Consecutive
+
+# use \n instead of \r\n
+UseCRLF: false
+
+AccessModifierOffset: -4
+EmptyLineBeforeAccessModifier: Always
+EmptyLineAfterAccessModifier: Never
+
+NamespaceIndentation: None
+BreakConstructorInitializers: BeforeComma
+
+# we have some problems with ranges-v3 and AUI's AUI_LET, so keep it disabled
+SortIncludes: Never
+
+# Don't pack parameters onto one line — each parameter on its own line
+BinPackParameters: false
+
+# Don't pack arguments in function calls either
+BinPackArguments: false
+
+# High penalty to discourage keeping excess characters on a line
+PenaltyExcessCharacter: 100
+
+# Don't break after return type — keep return type on the same line as function name
+# (Google style defaults to AlwaysBreakAfterReturnType, which causes the inconsistency)
+AlwaysBreakAfterReturnType: None
+
+# Low penalty for breaking after the return type
+PenaltyReturnTypeOnItsOwnLine: 60
+
+
+################################################# UI BUILDING ##########################################################
+
+# use shorter indentation for UI building stuff (like in Dart/Flutter)
+BracedInitializerIndentWidth: 2
+ConstructorInitializerIndentWidth: 2
+
+# better spacing around AUI_OVERRIDE_STYLE and AUI_LET.
+# before:
+# view AUI_OVERRIDE_STYLE{Expanding()},
+# view AUI_LET{printf("Hello");},
+#
+# after:
+# view AUI_OVERRIDE_STYLE { Expanding() },
+# view AUI_LET { printf("Hello"); },
+Cpp11BracedListStyle: false
+SpaceBeforeCpp11BracedList: true
+
+# forces nested initializer lists to begin with their own lines.
+# note: you should use comma after last element in initializer lists.
+# before:
+# Centered { Horizontal {
+#
+# after:
+# Centered {
+#   Horizontal {
+PenaltyIndentedWhitespace: 1000
+BreakBeforeBraces: Attach
+BreakBeforeBinaryOperators: None
+  
+StatementAttributeLikeMacros:
+  - emit
+
+# fix AUI's scary macros.
+Macros:
+  - AUI_LET=+[]
+  - AUI_THREADPOOL=[]
+  - AUI_DECLARATIVE_FOR(a,b,c)=[v2=b,v3=c](a)
+  - AUI_DECLARATIVE_FOR_EX(a,b,c,d)=[d,v2=b,v3=c](a)
+  - AUI_OVERRIDE_STYLE=+std::vector

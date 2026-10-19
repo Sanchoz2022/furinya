@@ -1,0 +1,220 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GIT_SUBMODULE_STRATEGY: recursive
+
+permissions:
+  contents: write
+
+jobs:
+  build-desktop:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Fetch sources
+        uses: actions/checkout@v4
+
+      # Cache AUI boot directory
+      - name: Cache AUI.BOOT deps
+        id: cache-aui-boot
+        uses: actions/cache@v3
+        env:
+          cache-name: aui-boot
+        with:
+          path: ~/.aui
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+            ${{ runner.os }}-build-
+            ${{ runner.os }}-
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja pkg-config ffmpeg openssl@3
+
+      - name: Setup Clang (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "CC=$(brew --prefix llvm)/bin/clang" >> $GITHUB_ENV
+          echo "CXX=$(brew --prefix llvm)/bin/clang++" >> $GITHUB_ENV
+          echo "LDFLAGS=-L$(brew --prefix llvm)/lib/c++ -Wl,-rpath,$(brew --prefix llvm)/lib/c++" >> $GITHUB_ENV
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> $GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix)" >> $GITHUB_ENV
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install \
+          pkg-config \
+          libglew-dev \
+          zlib1g-dev \
+          libssl-dev \
+          libcrypt-dev \
+          libcurl4-openssl-dev \
+          libgtk-4-dev \
+          libadwaita-1-dev \
+          libdbus-1-dev \
+          libfontconfig-dev \
+          ninja-build \
+          libpulse-dev \
+          gperf
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install innosetup
+
+      - name: Setup Clang 22 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22 all
+          echo "CC=clang-22" >> $GITHUB_ENV
+          echo "CXX=clang++-22" >> $GITHUB_ENV
+
+      - name: Setup Clang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install llvm -y
+          echo "CC=clang" >> $env:GITHUB_ENV
+          echo "CXX=clang++" >> $env:GITHUB_ENV
+
+      - name: Configure CMake
+        run: cmake -G "Ninja" -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=RelWithDebInfo ${{ runner.os == 'Windows' && '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded' || '' }} -DAUI_INSTALL_RUNTIME_DEPENDENCIES=TRUE
+
+      - name: Build Project
+        run: cmake --build ${{github.workspace}}/build --config RelWithDebInfo
+
+      - name: Test Hot-Reloading (macOS & Linux)
+        if: runner.os != 'Windows'
+        working-directory: ${{github.workspace}}/build/bin
+        run: |
+          # 1. Создаем конфиг с отключенным Telegram
+          echo '[general]' > config.toml
+          echo 'telegram_enabled = false' >> config.toml
+          echo 'character_name = "Kuni"' >> config.toml
+          echo 'papik_name = "Alex2772"' >> config.toml
+          echo 'papik_chat_id = 625207005' >> config.toml
+          echo 'telegram_api_id = 12345' >> config.toml
+          echo 'telegram_api_hash = "abc"' >> config.toml
+          
+          # 2. Запускаем через бесконечный пайп ввода tail -f /dev/null, чтобы std::cin не ловил EOF
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            tail -f /dev/null | ./Kuni.app/Contents/MacOS/Kuni &> kuni_run.log &
+          else
+            tail -f /dev/null | ./kuni &> kuni_run.log &
+          fi
+          KUNI_PID=$!
+          
+          # 3. Даем боту 3 секунды инициализироваться
+          sleep 3
+          
+          # 4. Имитируем изменение файла
+          echo 'misc.remind_use_ask = false' >> config.toml
+          
+          # 5. Даем 3 секунды поймать событие
+          sleep 3
+          
+          # 6. Убиваем фоновый процесс бота
+          kill -9 $KUNI_PID || true
+          
+          # 7. Выводим лог для истории и проверяем релоад
+          cat kuni_run.log
+          if grep -q "reloading" kuni_run.log; then
+            echo "SUCCESS: Hot-reloading works natively on ${{ runner.os }}!"
+          else
+            echo "ERROR: Hot-reloading failed to detect file modification on ${{ runner.os }}!"
+            exit 1
+          fi
+
+      - name: Build Tests
+        run: cmake --build ${{github.workspace}}/build --config RelWithDebInfo --target Tests
+
+      - name: Run Tests (Windows)
+        if: runner.os == 'Windows'
+        working-directory: ${{github.workspace}}/build/bin
+        run: ${{github.workspace}}/build/bin/Tests.exe --gtest_filter=-"*Integration*"
+
+      - name: Run Tests (Linux and macOS)
+        if: runner.os != 'Windows'
+        working-directory: ${{github.workspace}}/build/bin
+        run: ${{github.workspace}}/build/bin/Tests "--gtest_filter=-*Integration*"
+
+      - name: Pack Windows Setup
+        if: runner.os == 'Windows'
+        working-directory: ${{github.workspace}}/build
+        run: |
+          cmake . -DAUI_APP_PACKAGING=INNOSETUP
+          cmake --build . --config RelWithDebInfo
+          cpack . -CRelWithDebInfo -B artifacts
+
+      - name: Pack Portable
+        working-directory: ${{github.workspace}}/build
+        run: |
+          cmake . -DAUI_APP_PACKAGING=${{ runner.os == 'Linux' && 'AUI_PORTABLE_TGZ' || 'AUI_PORTABLE_ZIP' }}
+          cmake --build . --config RelWithDebInfo
+          cpack . -CRelWithDebInfo -B artifacts
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          path: ${{github.workspace}}/build/artifacts/*.*
+          name: ${{ runner.os }}
+
+
+  release-draft:
+    runs-on: ubuntu-latest
+    permissions: write-all
+    if: github.event_name != 'pull_request'
+    needs: [ build-desktop ]
+    name: "Release draft"
+    steps:
+      - name: Fetch sources
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        run: |
+          VERSION=$(grep -Po '[0-9\.]+(?= # CI_PROJECT_VERSION)' CMakeLists.txt)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION = $VERSION"
+
+      # Remove old release drafts
+      - name: Remove Old Release Drafts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api repos/{owner}/{repo}/releases \
+            --jq '.[] | select(.draft == true) | .id' \
+            | xargs -I '{}' gh api -X DELETE repos/{owner}/{repo}/releases/{}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: 'true'
+
+      - name: Create Release Draft
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "v${{ env.VERSION }}" \
+            --draft \
+            --title "v${{ env.VERSION }}" \
+            --target $GITHUB_SHA \
+            artifacts/*.*
