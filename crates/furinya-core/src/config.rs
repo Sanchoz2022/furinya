@@ -179,6 +179,15 @@ pub struct MiscConfig {
     /// (после этого — тишина, ждём его). Страховка от спама.
     #[serde(default = "default_idle_ping_max")]
     pub idle_ping_max: u32,
+    /// Тихие часы: юзер обычно спит с этого часа (локальное время) до
+    /// `quiet_hours_end` (не включается). В это время бот НЕ пишет первой,
+    /// НЕ будит сообщениями и НЕ шлёт «спокойной ночи» — только тихо
+    /// консолидирует память. 0 = выключено (или start == end).
+    /// Окно через полночь: start=23, end=7.
+    #[serde(default)]
+    pub quiet_hours_start: u32,
+    #[serde(default)]
+    pub quiet_hours_end: u32,
 }
 
 fn default_tool_reminder_prob() -> f32 {

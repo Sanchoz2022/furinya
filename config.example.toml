@@ -47,6 +47,10 @@ nsfw = true
 [misc]
 idle_message_timeout_secs = 300
 sleep_timeout_secs = 900
+# Окно, когда юзер обычно спит: в это время бот не пишет первой и не будит.
+# Часы по локальному времени, 0 = выключено. Окно через полночь: 23 → 7.
+quiet_hours_start = 2
+quiet_hours_end = 10
 diary_dir = "data/diary"
 diary_keep_last = 20
 active_top_k = 6

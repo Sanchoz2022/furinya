@@ -17,7 +17,7 @@ use furinya_llm::{
 use furinya_vision::describe_photo;
 use furinya_audio::{synthesize_speech_openai, synthesize_fish_voice, transcribe_audio};
 use furinya_sd::generate_image;
-use chrono::Utc;
+use chrono::{Local, Timelike, Utc};
 use rand::Rng;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
@@ -1330,6 +1330,11 @@ pub async fn run_telegram_mode(
     let idle_window_max = cfg.misc.idle_window_max_secs.max(idle_window_min);
     let idle_ping_max = cfg.misc.idle_ping_max.max(1);
     let idle_policy = crate::idle::IdlePolicy::new(idle_window_min, idle_window_max, idle_ping_max);
+    // Тихие часы: юзер спит — инициативу не проявляем (привязка к контексту).
+    let quiet_hours =
+        crate::idle::QuietHours::new(cfg.misc.quiet_hours_start, cfg.misc.quiet_hours_end);
+    // Следит за окном тихих часов: «заснула» / «проснулась».
+    let mut quiet_watcher = crate::idle::QuietWatcher::new();
     // next_idle_at — момент, когда можно ПРЕДЛОЖИТЬ ей написать первой.
     // Дальше решает модель: пишет или зовёт stay_quiet (молчит). Окно
     // каждый раз случайное — чтобы не выходило «ровно как по часам».
@@ -1550,6 +1555,32 @@ pub async fn run_telegram_mode(
                         client.set_online(false);
                         info!("[tg][debug] статус: offline (тишина {}с)", elapsed_user);
                     }
+                    // ── Тихие часы: он спит — не будим ────────────────────
+                    // Привязка активности к контексту: в окно, когда юзер
+                    // обычно спит, бот молчит (только консолидация памяти).
+                    let local_now = Local::now();
+                    let local_hour = local_now.hour() % 24;
+                    let quiet = quiet_hours.is_quiet_now(local_hour);
+                    match quiet_watcher.event(quiet) {
+                        crate::idle::QuietEvent::Entered => {
+                            // Вошли в тихие часы: он спит — молчим и не будим.
+                            info!(
+                                "[tg] тихие часы ({}:{}) — сплю молча, не бужу",
+                                local_now.hour(),
+                                local_now.minute()
+                            );
+                        }
+                        crate::idle::QuietEvent::Woke => {
+                            // Тихие часы кончились — проснулась: инициатива снова
+                            // разрешена (с новым случайным окном).
+                            info!("[tg] тихие часы кончились ({}:00) — проснулась", local_hour);
+                            asleep = false;
+                            idle_pings = 0;
+                            next_idle_at =
+                                Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+                        }
+                        crate::idle::QuietEvent::None => {}
+                    }
                     // ── СОН: давно тихо (и его, и нас) ─────────────────────
                     // Консолидация по правилу Саши: только перед сном или при
                     // context overflow (см. после handle_new_message).
@@ -1596,29 +1627,35 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[сон] [внутреннее] Тишина затянулась ({} минут). Ты устала и можешь уйти дремать. Реши сама: сказать короткое «ухожу дремать / спокойной ночи» (одна часть, своими словами, без громких прощаний и без «жаль что ты молчишь») — или просто промолчать (stay_quiet). Это тихий момент, не драма.{}", elapsed_any / 60, own_recent_quotes(&tg_history_full, 2)) } }
+                                "content": { "text": { "text": format!("[сон] [внутреннее] Сейчас {}:{} по времени Саши. Тишина затянулась ({} минут). Ты устала и можешь уйти дремать. Реши сама: сказать короткое «ухожу дремать / спокойной ночи» (одна часть, своими словами, без громких прощаний и без «жаль что ты молчишь») — или просто промолчать (stay_quiet). Это тихий момент, не драма.{}", local_now.hour(), local_now.minute(), elapsed_any / 60, own_recent_quotes(&tg_history_full, 2)) } }
                             }
                         });
                         let before = tg_history_full.len();
-                        handle_new_message(
-                            stim,
-                            llm,
-                            &client,
-                            diary,
-                            prompts,
-                            diary_entries,
-                            &mut tg_history,
-                            &mut tg_history_full,
-                            &tg_system_prompt,
-                            cfg,
-                            my_id,
-                            // is_idle=true: тесты reader-ловушек не сработают,
-                            // спящая реплика — это инициативный ход.
-                            true,
-                        )
-                        .await;
-                        if tg_history_full.len() > before {
-                            client.set_online(true);
+                        if quiet {
+                            // Тихие часы: он спит — «спокойной ночи» НЕ пишем,
+                            // просто засыпаем молча (консолидация выше уже сделана).
+                            info!("[tg] тихие часы — засыпаю молча, сообщение не отправляю");
+                        } else {
+                            handle_new_message(
+                                stim,
+                                llm,
+                                &client,
+                                diary,
+                                prompts,
+                                diary_entries,
+                                &mut tg_history,
+                                &mut tg_history_full,
+                                &tg_system_prompt,
+                                cfg,
+                                my_id,
+                                // is_idle=true: тесты reader-ловушек не сработают,
+                                // спящая реплика — это инициативный ход.
+                                true,
+                            )
+                            .await;
+                            if tg_history_full.len() > before {
+                                client.set_online(true);
+                            }
                         }
                         // Уснула: первыми больше не пишем, пока он не напишет.
                         asleep = true;
@@ -1632,6 +1669,7 @@ pub async fn run_telegram_mode(
                     // Таймер НЕ пикает «надо ответить»: он лишь даёт шанс.
                     // Дальше решает модель — написать или промолчать.
                     if idle_policy.may_offer(asleep, idle_pings)
+                        && !quiet
                         && Instant::now() >= next_idle_at
                     {
                         info!(
@@ -1647,7 +1685,7 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[idle] [внутреннее] Тишина: Саша не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если нечего сказать или не хочется — вызови stay_quiet и промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.{}", elapsed_any / 60, own_hint) } }
+                                "content": { "text": { "text": format!("[idle] [внутреннее] Сейчас {}:{} по времени Саши. Тишина: он не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если он сейчас спит или ему не до тебя — не пиши вовсе (stay_quiet). Если нечего сказать или не хочется — тоже промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.{}", local_now.hour(), local_now.minute(), elapsed_any / 60, own_hint) } }
                             }
                         });
                         let before = tg_history_full.len();

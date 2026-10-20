@@ -51,9 +51,146 @@ impl IdlePolicy {
     }
 }
 
+/// Тихие часы: окно, когда юзер обычно спит.
+/// В это время бот НЕ проявляет инициативу, не пишет «спокойной ночи» и
+/// не будит сообщениями — только тихо консолидирует память.
+/// Окно может переходить через полночь (23 → 7).
+#[derive(Debug, Clone, Copy)]
+pub struct QuietHours {
+    /// Начало (час по локальному времени). 0 = выключено.
+    pub start: u32,
+    /// Конец (час, НЕ включается). 0 = выключено.
+    pub end: u32,
+}
+
+impl QuietHours {
+    pub fn new(start: u32, end: u32) -> Self {
+        let start = start.min(23);
+        let end = end.min(23);
+        Self { start, end }
+    }
+
+    /// Включены ли тихие часы (start != end).
+    pub fn enabled(&self) -> bool {
+        self.start != self.end
+    }
+
+    /// В тихие ли часы сейчас (час по локальному времени, 0..23).
+    pub fn is_quiet_now(&self, hour: u32) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+        let h = hour.min(23);
+        if self.start < self.end {
+            h >= self.start && h < self.end
+        } else {
+            // окно через полночь: 23..7 → h >= 23 || h < 7
+            h >= self.start || h < self.end
+        }
+    }
+}
+
+/// Событие смены состояния «тихие часы» — вынесено, чтобы логика
+/// «заснула / проснулась» была покрыта тестами.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuietEvent {
+    /// Ничего не изменилось.
+    None,
+    /// Вошли в тихие часы: он спит — замолчали.
+    Entered,
+    /// Вышли из тихих часов: проснулись, инициатива снова разрешена.
+    Woke,
+}
+
+/// Следит за окном тихих часов и сообщает о сменах состояния.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QuietWatcher {
+    was_quiet: bool,
+}
+
+impl QuietWatcher {
+    pub fn new() -> Self {
+        Self { was_quiet: false }
+    }
+
+    /// Состояние окна на данный момент (для логов и решений).
+    pub fn event(&mut self, quiet_now: bool) -> QuietEvent {
+        if quiet_now && !self.was_quiet {
+            self.was_quiet = true;
+            QuietEvent::Entered
+        } else if !quiet_now && self.was_quiet {
+            self.was_quiet = false;
+            QuietEvent::Woke
+        } else {
+            QuietEvent::None
+        }
+    }
+
+    /// Находимся ли сейчас в тихих часах.
+    pub fn in_quiet(&self) -> bool {
+        self.was_quiet
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_reports_enter_and_wake() {
+        let mut w = QuietWatcher::new();
+        assert_eq!(w.event(false), QuietEvent::None);
+        assert_eq!(w.event(true), QuietEvent::Entered);
+        assert_eq!(w.event(true), QuietEvent::None, "повторно не событие");
+        assert!(w.in_quiet());
+        assert_eq!(w.event(false), QuietEvent::Woke);
+        assert_eq!(w.event(false), QuietEvent::None);
+        assert!(!w.in_quiet());
+    }
+
+    #[test]
+    fn watcher_started_inside_quiet_wakes_once() {
+        let mut w = QuietWatcher::new();
+        // Бот стартовал ночью: первый тик — тихие часы, потом рассвет.
+        assert_eq!(w.event(true), QuietEvent::Entered);
+        assert_eq!(w.event(true), QuietEvent::None);
+        assert_eq!(w.event(false), QuietEvent::Woke);
+    }
+
+    #[test]
+    fn quiet_hours_basic_window() {
+        let q = QuietHours::new(2, 9);
+        assert!(q.enabled());
+        assert!(!q.is_quiet_now(1));
+        assert!(q.is_quiet_now(2));
+        assert!(q.is_quiet_now(5));
+        assert!(q.is_quiet_now(8));
+        assert!(!q.is_quiet_now(9));
+        assert!(!q.is_quiet_now(14));
+    }
+
+    #[test]
+    fn quiet_hours_across_midnight() {
+        let q = QuietHours::new(23, 7);
+        assert!(q.is_quiet_now(23));
+        assert!(q.is_quiet_now(2));
+        assert!(q.is_quiet_now(6));
+        assert!(!q.is_quiet_now(7));
+        assert!(!q.is_quiet_now(12));
+    }
+
+    #[test]
+    fn quiet_hours_disabled() {
+        let q = QuietHours::new(0, 0);
+        assert!(!q.enabled());
+        for h in 0..24 {
+            assert!(!q.is_quiet_now(h));
+        }
+        // start == end — тоже выключено
+        let q2 = QuietHours::new(5, 5);
+        assert!(!q2.enabled());
+        assert!(!q2.is_quiet_now(5));
+    }
 
     #[test]
     fn delay_within_window() {
