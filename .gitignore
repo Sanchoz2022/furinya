@@ -16,3 +16,6 @@ tdlib/db.sqlite*
 tdlib/td.binlog
 temp_*.jpg
 nohup.out
+
+# Секреты деплоя (VLESS-узел для Mihomo) — не в репо
+deploy/secrets/

@@ -16,15 +16,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PVE_HOST="${PVE_HOST:-192.168.1.241}"
-LXC_ID="${LXC_ID:-101}"
+LXC_ID="${LXC_ID:-111}"          # 101 занят navidrome
 LXC_NAME="${LXC_NAME:-furinya}"
-LXC_IP="${LXC_IP:-192.168.1.75}"
+LXC_IP="${LXC_IP:-192.168.1.75}"  # vmbr0 — единственный мост с интернетом и доступом к sd-api
 LXC_CIDR="${LXC_CIDR:-24}"
 LXC_GW="${LXC_GW:-192.168.1.1}"
 LXC_BRIDGE="${LXC_BRIDGE:-vmbr0}"
 LXC_CORES="${LXC_CORES:-2}"
 LXC_MEM="${LXC_MEM:-2048}"
-LXC_DISK="${LXC_DISK:-8}"
+LXC_DISK="${LXC_DISK:-12}"
+SD_LXC_ID="${SD_LXC_ID:-110}"      # sd-api
+MIX_PORT="${MIX_PORT:-7890}"
 APP_DIR="/opt/furinya"
 
 ssh_pve() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$PVE_HOST" "$@"; }
@@ -93,13 +95,30 @@ cp prompts/*.md                     "$STAGE/payload/prompts/"
 cp config.toml                      "$STAGE/payload/config.toml"
 cp -r data/tdlib_db/.               "$STAGE/payload/data/tdlib_db/" 2>/dev/null || true
 cp -r data/diary/.                  "$STAGE/payload/data/diary/" 2>/dev/null || true
+cp deploy/setup-mihomo.sh           "$STAGE/payload/setup-mihomo.sh"
+cp deploy/secrets/node.json         "$STAGE/payload/node.json" 2>/dev/null || true
+
+# Адрес sd-api: он на DHCP в vmbr0 — узнаём актуальный и пишем в .env,
+# чтобы sd-сервер не уезжал.
+SD_IP="$(ssh_pve "pct exec $SD_LXC_ID -- hostname -I" 2>/dev/null | awk '{print $1}')"
+echo "    sd-api ($SD_LXC_ID) на $SD_IP"
+if [ -z "$SD_IP" ]; then
+  SD_IP="$(ssh_pve "pvesh get /nodes/$(hostname)/lxc/$SD_LXC_ID/interface/0/ip 2>/dev/null" | tr -d '"')"
+  SD_IP="${SD_IP%%/*}"
+fi
+
 # .env с ключами из текущего окружения (значения в лог не печатаются)
 {
   echo "MISTRAL_API_KEY=${MISTRAL_API_KEY:-}"
   echo "GROQ_API_KEY=${GROQ_API_KEY:-}"
   echo "FISH_API_KEY=${FISH_API_KEY:-}"
   echo "FURINYA_HORDE_KEY=${FURINYA_HORDE_KEY:-}"
-  echo "SD_API_URL=${SD_API_URL:-http://192.168.1.172:8082/}"
+  echo "SD_API_URL=${SD_API_URL:-http://${SD_IP:-192.168.1.172}:8082/}"
+  # Прокси через Mihomo (см. deploy/setup-mihomo.sh): без него api.groq.com → 403.
+  # NO_PROXY — чтобы sd-сервер и локалка шли напрямую, мимо прокси.
+  echo "HTTP_PROXY=http://127.0.0.1:${MIX_PORT}"
+  echo "HTTPS_PROXY=http://127.0.0.1:${MIX_PORT}"
+  echo "NO_PROXY=127.0.0.1,localhost,${SD_IP:-192.168.1.172},192.168.1.0/24,10.0.0.0/8"
   echo "FURINYA_TD_QUIET=1"
 } > "$STAGE/payload/.env"
 
@@ -111,6 +130,12 @@ tar -C "$STAGE/payload" -czf - . | ssh_pve \
 echo "==> Настраиваем сервис"
 scp -q deploy/furinya.service "root@$PVE_HOST:/tmp/furinya.service"
 ssh_pve "pct push $LXC_ID /tmp/furinya.service /etc/systemd/system/furinya.service"
+# ── Mihomo (прокси для внешних API) ────────────────────────────────────────
+if [ -f "$STAGE/payload/node.json" ]; then
+  echo "==> Ставим Mihomo в LXC"
+  ssh_pve "pct exec $LXC_ID -- bash /opt/furinya/setup-mihomo.sh /opt/furinya/node.json" || \
+    echo "    ⚠ Mihomo не поставился — бот будет ходить напрямую"
+fi
 ssh_pve "pct exec $LXC_ID -- bash -c '
   set -e
   id furinya >/dev/null 2>&1 || useradd -m -s /bin/bash furinya
