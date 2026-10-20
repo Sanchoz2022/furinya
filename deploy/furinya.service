@@ -1,0 +1,24 @@
+[Unit]
+Description=Furinya — Telegram AI-бот (TDLib user-account)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=furinya
+Group=furinya
+WorkingDirectory=/opt/furinya
+EnvironmentFile=/opt/furinya/.env
+ExecStart=/opt/furinya/furinya
+Restart=always
+RestartSec=10
+# Бот сам себя восстанавливает после ребута/обрыва.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=furinya
+
+# Немного послабления для TDLib (много файлов в data/tdlib_db)
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
