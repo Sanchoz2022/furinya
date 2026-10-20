@@ -46,11 +46,20 @@ echo "    шаблон: $LXC_TEMPLATE"
 # ── 2. Создание/старт LXC ──────────────────────────────────────────────────
 if ! ssh_pve "pct status $LXC_ID" >/dev/null 2>&1; then
   echo "==> Создаём LXC $LXC_ID ($LXC_NAME) на $LXC_IP"
-  ssh_pve "pct create $LXC_ID $LXC_TEMPLATE \
-    --hostname $LXC_NAME --cores $LXC_CORES --memory $LXC_MEM --swap 512 \
-    --rootfs local-lvm:${LXC_DISK} --ostype debian --unprivileged 1 \
-    --net0 name=eth0,bridge=$LXC_BRIDGE,ip=$LXC_IP/$LXC_CIDR,gw=$LXC_GW \
-    --onboot 1"
+  # Storage для rootfs: пробуем LVM → dir → zfs (что есть на хосте).
+  CREATED=0
+  for ST in "${LXC_STORAGE:-local-lvm}" local local-zfs; do
+    if ssh_pve "pct create $LXC_ID $LXC_TEMPLATE \
+      --hostname $LXC_NAME --cores $LXC_CORES --memory $LXC_MEM --swap 512 \
+      --rootfs ${ST}:${LXC_DISK} --ostype debian --unprivileged 1 \
+      --net0 name=eth0,bridge=$LXC_BRIDGE,ip=$LXC_IP/$LXC_CIDR,gw=$LXC_GW \
+      --onboot 1" 2>&1 | tail -3; then
+      if ssh_pve "pct status $LXC_ID" >/dev/null 2>&1; then
+        echo "    rootfs на storage: $ST"; CREATED=1; break
+      fi
+    fi
+  done
+  [ "$CREATED" = "1" ] || { echo "Не удалось создать LXC"; exit 1; }
   echo "==> Старт LXC"
   ssh_pve "pct start $LXC_ID"
   echo "==> Ставим базу (обновление apt — заодно проверка сети)"

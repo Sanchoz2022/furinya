@@ -21,7 +21,7 @@ docker run --rm \
   "$IMAGE" bash -c "
     set -e
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends build-essential pkg-config ca-certificates curl git
+    apt-get install -y -qq --no-install-recommends build-essential pkg-config ca-certificates curl git libssl-dev
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUST_VERSION --profile minimal
     . /tmp/cargo/env
     cargo build --release --workspace --bin furinya
