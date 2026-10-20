@@ -9,6 +9,7 @@ members = [
     "crates/furinya-audio",
     "crates/furinya-sd",
     "bins/furinya",
+    "bins/furinya-deploy",
     "bins/tg-history-inspect",
     "bins/tg-consolidate",
     "bins/file-consolidate",

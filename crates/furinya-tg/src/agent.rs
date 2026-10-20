@@ -12,7 +12,7 @@ use furinya_diary::{
     Diary, Entry, active_context, consolidate_memory, read_active,
 };
 use furinya_llm::{
-    LlmClient, Message, Role, ToolCall, build_tools, extract_thinking, extract_thinking_from_content,
+    LlmClient, Message, ToolCall, build_tools, extract_thinking, extract_thinking_from_content,
 };
 use furinya_vision::describe_photo;
 use furinya_audio::{synthesize_speech_openai, synthesize_fish_voice, transcribe_audio};
@@ -993,18 +993,9 @@ pub async fn handle_new_message(
         messages.extend(hist_tail);
         // Инструментальный контекст текущего вызова — строго в порядке:
         // assistant(tool_calls) → tool(результат).
+        // Порядок и «хвост» сообщений приводит к допустимому для Mistral
+        // сам текстовый модуль (furinya_llm::sanitize_messages) — там же тесты.
         messages.extend(turn_ctx.iter().cloned());
-        // Mistral отвергает запрос, который заканчивается «голым» assistant
-        // (без tool_calls) — 400 invalid_request_message_order. Так бывает,
-        // когда хвост истории заканчивается её собственной репликой, а
-        // инструментального контекста в этом ходе нет.
-        if messages
-            .last()
-            .map(|m| m.role == Role::Assistant && m.tool_calls.is_none())
-            .unwrap_or(false)
-        {
-            messages.pop();
-        }
         if turn == 1 && is_idle {
             // Idle-стимул не пишется в живую историю — добавляем в запрос напрямую.
             messages.push(Message::user(effective_text.clone()));
@@ -1244,6 +1235,14 @@ pub async fn handle_new_message(
                 // Живая память: то, что я отправила, записываю СРАЗУ
                 // (раньше собственные ответы не запоминались вообще).
                 record_my_send(tg_history, tg_history_full, my_id, cfg, &sent_echo);
+                // ВАЖНО: tool-результат обязателен. Без него в turn_ctx остаётся
+                // assistant с неотвеченными вызовами → следующий запрос к
+                // Mistral падает с 400 «Expected last role User or Tool».
+                turn_ctx.push(Message::tool_result(
+                    Some(call_id),
+                    Some("send_telegram_message".to_string()),
+                    result.clone(),
+                ));
                 message_sends += 1;
                 if message_sends >= 2 {
                     // Больше двух сообщений за вызов не шлём.

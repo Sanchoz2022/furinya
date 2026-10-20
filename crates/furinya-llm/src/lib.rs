@@ -739,6 +739,91 @@ fn config_base_is_mistral(cfg: &Config) -> bool {
     cfg.general.llm.endpoint.base_url.contains("api.mistral.ai")
 }
 
+
+/// Приводит историю сообщений к виду, который принимает Mistral (и другие
+/// OpenAI-совместимые бэкенды).
+///
+/// Правила (каждое — реальная ошибка 400 от Mistral):
+/// 1. Последнее сообщение не должно быть «голым» assistant без tool_calls:
+///    `Expected last role User or Tool (or Assistant with prefix True)`.
+/// 2. Сообщение с ролью `tool` обязано идти сразу за assistant'ом с
+///    tool_calls — иначе «осиротевший» tool ломает порядок (400 3230).
+/// 3. У assistant'а с tool_calls должны быть ответы-tool; если их нет —
+///    вызовы снимаются (иначе API ждёт tool-результат, которого не будет).
+/// 4. Первой не может быть `tool` (такие висят в начале — ломают порядок).
+/// 5. Если не осталось ни одного не-системного сообщения — добавляем
+///    пустой user, иначе запрос бессмысленен.
+pub fn sanitize_messages(messages: Vec<Message>) -> Vec<Message> {
+// 4) ведущие tool убираем
+let mut out: Vec<Message> = messages
+    .into_iter()
+    .skip_while(|m| m.role == Role::Tool)
+    .collect();
+
+// 2) и 3) выкидываем осиротевшие tool и чиним assistant без ответов
+let mut cleaned: Vec<Message> = Vec::with_capacity(out.len());
+let mut i = 0usize;
+while i < out.len() {
+    let m = out[i].clone();
+    if m.role == Role::Tool {
+        // tool без предшествующего assistant(tool_calls) — выкидываем.
+        let has_owner = cleaned
+            .last()
+            .map(|p| p.role == Role::Assistant && p.tool_calls.is_some())
+            .unwrap_or(false);
+        if !has_owner {
+            i += 1;
+            continue;
+        }
+        cleaned.push(m);
+        i += 1;
+        continue;
+    }
+    if m.role == Role::Assistant {
+        if let Some(calls) = m.tool_calls.clone() {
+            if !calls.is_empty() {
+                // Считаем, сколько tool-ответов идёт сразу после.
+                let mut j = i + 1;
+                let mut answers = 0usize;
+                while j < out.len() && out[j].role == Role::Tool {
+                    answers += 1;
+                    j += 1;
+                }
+                if answers == 0 {
+                    // 3) ответов нет — снимаем вызовы, оставляем текст.
+                    let mut plain = m.clone();
+                    plain.tool_calls = None;
+                    cleaned.push(plain);
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+    }
+    cleaned.push(m);
+    i += 1;
+}
+out = cleaned;
+
+// 1) последнее сообщение — не assistant (Mistral требует user/tool в конце;
+//    assistant допустим только с tool_calls, но тогда нужны ответы-tool).
+//    Снимаем ВСЕ хвостовые assistant-сообщения: их может быть несколько
+//    (её реплика в истории + неотвеченный вызов инструмента).
+while out.last().map(|m| m.role == Role::Assistant).unwrap_or(false) {
+    out.pop();
+}
+// Замыкающие system тоже убираем (последним должен быть user/tool).
+while out.last().map(|m| m.role == Role::System).unwrap_or(false) {
+    out.pop();
+}
+// 5) пустой запрос — подставляем минимальный user
+if out.iter().all(|m| m.role == Role::System) {
+    out.push(Message::user("(продолжи разговор)"));
+}
+out
+}
+
+
 impl LlmClient {
     /// Прямой конструктор (для тестов / нестандартных сценариев).
     ///
@@ -814,8 +899,7 @@ impl LlmClient {
             "required".to_string()
         }
     }
-
-    /// Non-streaming запрос. Возвращает первый choice.
+/// Non-streaming запрос. Возвращает первый choice.
     ///
     /// При ошибке основной модели повторяет запрос на fallback-моделях.
     pub async fn chat(
@@ -849,6 +933,8 @@ impl LlmClient {
         // tool_choice шлём ТОЛЬКО вместе с tools: Mistral отвечает 400
         // ("No tools provided for tool choice `any`") на tool_choice без tools.
         let tool_choice = tools.as_ref().map(|_| self.tool_choice_value());
+        // Порядок сообщений приводим к допустимому для Mistral (400 3230).
+        let messages = sanitize_messages(messages);
         let req = ChatRequest {
             model: model.to_string(),
             messages,
@@ -925,6 +1011,8 @@ impl LlmClient {
     {
         // tool_choice только при наличии tools (Mistral: 400 иначе).
         let tool_choice = tools.as_ref().map(|_| self.tool_choice_value());
+        // Порядок сообщений приводим к допустимому для Mistral (400 3230).
+        let messages = sanitize_messages(messages);
         let req = ChatRequest {
             model: model.to_string(),
             messages,
@@ -1022,6 +1110,135 @@ fn parse_opt_f32(s: &str) -> Option<f32> {
         None
     } else {
         t.parse::<f32>().ok()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    fn assistant_text(s: &str) -> Message {
+        Message::assistant(s)
+    }
+    fn assistant_with_call(s: &str) -> Message {
+        let mut m = Message::assistant(s);
+        m.tool_calls = Some(vec![ToolCall {
+            id: "c1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "send_telegram_message".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        m
+    }
+    fn tool_result(s: &str) -> Message {
+        Message::tool_result(
+            Some("c1".to_string()),
+            Some("send_telegram_message".to_string()),
+            s.to_string(),
+        )
+    }
+
+    #[test]
+    fn drops_trailing_bare_assistant() {
+        // Реальный кейс: хвост истории кончается её собственной репликой →
+        // Mistral: "Expected last role User or Tool ... but got assistant".
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            assistant_text("привет-котик"),
+        ];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.last().unwrap().role, Role::User);
+    }
+
+    #[test]
+    fn keeps_assistant_with_tool_calls_at_end() {
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            assistant_with_call("сейчас минутку"),
+            tool_result("Отправлено 1 сообщений"),
+        ];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.last().unwrap().role, Role::Tool);
+    }
+
+    #[test]
+    fn drops_orphan_tool_message() {
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            tool_result("сирота"),
+        ];
+        let out = sanitize_messages(msgs);
+        assert!(out.iter().all(|m| m.role != Role::Tool));
+    }
+
+    #[test]
+    fn assistant_with_calls_without_answers_loses_calls() {
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            assistant_with_call("фото будет"),
+        ];
+        let out = sanitize_messages(msgs);
+        let last = out.last().unwrap();
+        // Вызовы сняты (ответов не было) — иначе API ждёт tool-результат.
+        assert!(last.tool_calls.is_none());
+    }
+
+    #[test]
+    fn drops_leading_tool_messages() {
+        let msgs = vec![tool_result("в начале"), Message::system("s"), Message::user("привет")];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.first().unwrap().role, Role::System);
+    }
+
+    #[test]
+    fn only_system_gets_stub_user() {
+        let msgs = vec![Message::system("s")];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.last().unwrap().role, Role::User);
+    }
+
+    #[test]
+    fn trailing_system_is_removed() {
+        let msgs = vec![Message::user("привет"), Message::system("s")];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.last().unwrap().role, Role::User);
+    }
+
+    #[test]
+    fn drops_all_trailing_assistants() {
+        // Реальный кейс фазы 2: хвост истории кончается её репликой, а в
+        // turn_ctx — assistant с неотвеченным вызовом (tool-результата нет).
+        // Раньше снимался только один — и запрос падал с 400.
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            assistant_text("мой ответ"),
+            assistant_with_call("фото будет"),
+        ];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.last().unwrap().role, Role::User);
+        assert!(!out.iter().any(|m| m.role == Role::Assistant));
+    }
+
+    #[test]
+    fn normal_conversation_untouched() {
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            assistant_text("мурр"),
+            Message::user("как дела"),
+        ];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.last().unwrap().role, Role::User);
     }
 }
 
