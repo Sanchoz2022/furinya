@@ -354,7 +354,9 @@ pub async fn generate_image_a1111(
     let _permit = SD_SERVER_SEM.acquire().await;
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        // Рендер SD занимает ~4 минуты (замер: 237с) — таймаут с запасом,
+        // иначе фото отваливается по таймауту под нагрузкой.
+        .timeout(std::time::Duration::from_secs(600))
         .build()
         .context("сборка HTTP-клиента для SD")?;
 

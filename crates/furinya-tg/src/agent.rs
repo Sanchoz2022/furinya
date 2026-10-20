@@ -877,6 +877,9 @@ pub async fn handle_new_message(
     let max_turns = 8;
     let mut ask_exhausted = false;
     let mut final_sent_via_tool = false;
+    // Сколько сообщений отправили за весь вызов (максимум 2) — чтобы после
+    // ответа модель не заваливала чат.
+    let mut message_sends = 0;
     // Модель САМА выбрала промолчать (stay_quiet) — ход закрывается тишиной.
     let mut chose_quiet = false;
     // Инструментальный диалог ЭТОГО вызова (assistant tool_calls → tool-результаты).
@@ -1063,6 +1066,12 @@ pub async fn handle_new_message(
                 info!("[tg] idle: модель промолчала (без tool_call)");
                 break;
             }
+            if final_sent_via_tool {
+                // Мы уже ответили в этом вызове, модель дописала текстом.
+                // Второго сообщения не шлём — просто закрываем ход.
+                debug!("[tg] после ответа модель не вызвала инструмент — ход закрыт");
+                break;
+            }
             // Модель не вернула tool_call (бэкенд проигнорировал tool_choice).
             // Строго по принципу: сырой текст НЕ отправляем в чат. Даём
             // системную подсказку ролью user (безопасный порядок для Mistral:
@@ -1224,7 +1233,15 @@ pub async fn handle_new_message(
                 // Живая память: то, что я отправила, записываю СРАЗУ
                 // (раньше собственные ответы не запоминались вообще).
                 record_my_send(tg_history, tg_history_full, my_id, cfg, &sent_echo);
-                break;
+                message_sends += 1;
+                if message_sends >= 2 {
+                    // Больше двух сообщений за вызов не шлём.
+                    break;
+                }
+                // ВАЖНО: здесь НЕ break. Модель часто вызывает в одном ходу
+                // send_telegram_message («сейчас, минутку 📸») И generate_image —
+                // раньше break съедал второй вызов, и фото не генерилось.
+                continue;
             }
             turn_ctx.push(Message::tool_result(
                 Some(call_id),
@@ -1252,14 +1269,25 @@ pub async fn handle_new_message(
         let handled = real_tool_done;
 
         if final_sent_via_tool {
-            debug!("[tg] финал уже отправлен через send_telegram_message, выходим");
-            break;
+            // Ответ уже отправлен, но ход НЕ закончен: модель может следующим
+            // вызовом вызвать generate_image (протокол «реплика → фото»).
+            // Если вызовов больше нет — она закончит текстом, и мы выйдем тихо.
+            if message_sends >= 2 || turn >= max_turns {
+                debug!("[tg] финал отправлен, ход закрываем");
+                break;
+            }
+            continue;
         }
         if handled {
             if turn == max_turns {
                 if is_idle {
                     // Idle: canned-реплика — это ровно тот «по часам» спам. Молчим.
                     warn!("[tg] idle: лимит tool-loop — промолчали вместо canned-реплики");
+                    break;
+                }
+                if final_sent_via_tool {
+                    // Ответ уже отправлен — canned-реплика не нужна.
+                    debug!("[tg] лимит tool-loop, но ответ уже отправлен — молча закрываем");
                     break;
                 }
                 warn!(
