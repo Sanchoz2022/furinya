@@ -222,6 +222,9 @@ impl Diary {
     pub fn query(&self, entries: &[Entry], query_embedding: &[f32]) -> Vec<QueryHit> {
         let mut hits: Vec<QueryHit> = entries
             .iter()
+            // Битые записи (metadata.corrupt) в выдачу НЕ идут: они помечены
+            // после неудачной консолидации и могут содержать мусор.
+            .filter(|e| !e.metadata.corrupt)
             .filter(|e| !e.metadata.embedding.is_empty())
             .map(|e| QueryHit {
                 entry: e.clone(),

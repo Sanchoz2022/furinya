@@ -229,6 +229,32 @@ fn own_recent_quotes(
     )
 }
 
+/// Обрезает строку по символам (без разрыва UTF-8).
+fn take_chars(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// Собирает блок памяти в рамках бюджета символов.
+/// Без этого память (дневник + выжимка чата) раздувала контекст до 100+ KB
+/// и упиралась в окно модели.
+fn budgeted_block(parts: &[String], budget: usize) -> String {
+    let mut out = String::new();
+    for p in parts {
+        if out.chars().count() >= budget {
+            break;
+        }
+        let rest = budget - out.chars().count();
+        let piece = take_chars(p, rest);
+        let full = piece.chars().count() == p.chars().count();
+        out.push_str(&piece);
+        if !full {
+            out.push_str("…");
+            break;
+        }
+    }
+    out
+}
+
 /// Исполняет TG-инструмент (send_telegram_message / react_with_emoji / ask / ...).
 /// Возвращает `(результат, отправленное)`:
 /// - результат — текст для tool-ответа модели;
@@ -870,27 +896,57 @@ pub async fn handle_new_message(
                     .or_else(|| voice_text.clone())
                     .unwrap_or_default()
             };
+            // ── Бюджет памяти в контексте ─────────────────────────────
+            // diary_injection_max_length — сколько символов памяти влезает
+            // в один запрос. Раньше лимита не было: дневник + выжимка чата
+            // давали 100+ KB (≈30K токенов) — впритык к окну модели (32K).
+            let mem_budget = cfg.misc.diary_injection_max_length.max(500) as usize;
+            let rag_budget = mem_budget / 2; // RAG-хиты
+            let summary_budget = mem_budget; // профиль + выжимка чата
+            let active_budget = mem_budget / 2; // свежие записи дневника
+            let mut injected_chars = 0usize;
             if let Ok(emb) = diary.embedding().embed(&rag_query).await {
-                let hits = diary.query(diary_entries, &emb);
+                // top-N: раньше сюда попадали ВСЕ записи выше порога — вместе
+                // с их полными телами (десятки КБ).
+                let hits = diary.query_top_n(diary_entries, &emb, 4);
                 if !hits.is_empty() {
-                    let mut ctx = String::from("Контекст (из моей памяти и недавнего чата):\n");
-                    for h in &hits {
-                        ctx.push_str(&format!("- {}\n", h.entry.body));
+                    let parts: Vec<String> = hits
+                        .iter()
+                        .map(|h| format!("- {}\n", h.entry.body))
+                        .collect();
+                    let ctx = budgeted_block(&parts, rag_budget);
+                    injected_chars += ctx.chars().count();
+                    if !ctx.trim().is_empty() {
+                        messages.push(Message::user(format!(
+                            "Контекст (из моей памяти и недавнего чата):\n{ctx}"
+                        )));
                     }
-                    messages.push(Message::user(ctx));
                 }
             }
-            // RAG по per-чат выжимке (data/chat_history/<chat_id>.md, профиль + выжимка слиты).
+            // RAG по per-чат выжимке (data/diary/chat_history/<chat_id>.md:
+            // профиль + выжимка слиты).
             let chat_summary_path = std::path::Path::new(&cfg.misc.diary_dir)
                 .join("chat_history")
                 .join(format!("{}.md", chat_id));
             if let Ok(summary) = std::fs::read_to_string(&chat_summary_path) {
                 let summary = summary.trim();
-                // Профиль + выжимка целиком (нащадим лимит — контекст модели широкий).
                 if !summary.is_empty() {
+                    // Профиль (до ---) — самое ценное, выжимка — сокращённо.
+                    let (profile, tail) = match summary.split_once("\n---\n") {
+                        Some((p, t)) => (p, t),
+                        None => (summary, ""),
+                    };
+                    let mut block = take_chars(profile, summary_budget);
+                    if !tail.trim().is_empty() {
+                        let rest = summary_budget.saturating_sub(block.chars().count());
+                        if rest > 300 {
+                            block.push_str("\n\n[выжимка чата, сокращённо]\n");
+                            block.push_str(&take_chars(tail, rest - 40));
+                        }
+                    }
+                    injected_chars += block.chars().count();
                     messages.push(Message::user(format!(
-                        "Контекст из истории этого чата (профиль + выжимка):\n{}",
-                        summary
+                        "Контекст из истории этого чата (профиль + выжимка):\n{block}"
                     )));
                 }
             }
@@ -900,12 +956,22 @@ pub async fn handle_new_message(
             let (_active_ts, corrupt) = read_active(&cfg.misc.diary_dir);
             let active = active_context(diary_entries, cfg.misc.active_top_k, &corrupt);
             if !active.is_empty() {
-                let mut mem = String::from("Активная память (свежие записи дневника):\n");
-                for e in &active {
-                    mem.push_str(&format!("- {}\n", e.body));
+                let parts: Vec<String> = active
+                    .iter()
+                    .map(|e| format!("- {}\n", take_chars(&e.body, 900)))
+                    .collect();
+                let mem = budgeted_block(&parts, active_budget);
+                injected_chars += mem.chars().count();
+                if !mem.trim().is_empty() {
+                    messages.push(Message::user(format!(
+                        "Активная память (свежие записи дневника):\n{mem}"
+                    )));
                 }
-                messages.push(Message::user(mem));
             }
+            info!(
+                "[tg] память в контексте: {} символов (хиты+профиль+выжимка+актив)",
+                injected_chars
+            );
         }
         // История чата: последние 8 сообщений в ХРОНОЛОГИЧЕСКОМ порядке
         // (раньше .rev() инвертировал переписку — модель читала её задом
