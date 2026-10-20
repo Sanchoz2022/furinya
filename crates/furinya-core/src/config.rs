@@ -167,6 +167,18 @@ pub struct MiscConfig {
     /// + сообщение "иду спать"). 0 = никогда не спать.
     #[serde(default = "default_sleep_to")]
     pub sleep_timeout_secs: u64,
+    /// Минимальная пауза (сек) перед тем, как ей будет ПРЕДЛОЖЕНО написать
+    /// первой. Таймер только даёт шанс — пишет она или молчит, решает модель.
+    #[serde(default = "default_idle_window_min")]
+    pub idle_window_min_secs: u64,
+    /// Максимальная пауза (сек) до того же шанса. Разброс между min и max —
+    /// чтобы «писать первой» не выглядело как по часам.
+    #[serde(default = "default_idle_window_max")]
+    pub idle_window_max_secs: u64,
+    /// Сколько своих инициативных сообщений подряд можно оставить без ответа
+    /// (после этого — тишина, ждём его). Страховка от спама.
+    #[serde(default = "default_idle_ping_max")]
+    pub idle_ping_max: u32,
 }
 
 fn default_tool_reminder_prob() -> f32 {
@@ -219,6 +231,15 @@ fn default_idle_msg() -> u64 {
 }
 fn default_sleep_to() -> u64 {
     1800 // 30 минут молчания → режим сна + consolidate
+}
+fn default_idle_window_min() -> u64 {
+    300 // 5 минут — раньше шанса «написать первой» не будет
+}
+fn default_idle_window_max() -> u64 {
+    900 // и не позже 15 минут (окно случайное → не «по часам»)
+}
+fn default_idle_ping_max() -> u32 {
+    3 // максимум 3 своих сообщения без ответа — дальше тишина
 }
 
 /// Секция [capabilities] (пока только заглушки, расширяем по ходу)
@@ -557,6 +578,11 @@ mod tests {
         assert!(cfg.general.llm.endpoint.base_url.contains("api.mistral.ai"));
         assert_eq!(cfg.general.llm.endpoint.model, "ministral-8b-2512");
         assert_eq!(cfg.general.llm.endpoint.fallback_model, "ministral-14b-2512");
+        // Эмбеддинги: модель обязана лежать ВНУТРИ endpoint.* — иначе в запрос
+        // уходит пустой model и Mistral отвечает 400 «Invalid model: None»
+        // (консолидация тихо откатывается в ноль записей).
+        assert_eq!(cfg.general.embedding.endpoint.model, "mistral-embed-2312");
+        assert!(cfg.general.embedding.endpoint.base_url.contains("api.mistral.ai"));
         // Vision на Mistral API: ПРОВЕРЕНО живьём — ministral-14b/8b
         // мультимодальные (писали описания картинок), medium/small — 429.
         assert_eq!(

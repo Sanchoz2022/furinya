@@ -14,6 +14,7 @@
 
 pub mod auth;
 pub mod agent;
+pub mod idle;
 
 use libloading::{Library, Symbol};
 use serde_json::Value;

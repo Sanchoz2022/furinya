@@ -387,6 +387,16 @@ async fn execute_tg_tool(
             };
             (res, Vec::new())
         }
+        "stay_quiet" => {
+            // Модель САМА решила промолчать. В чат не уходит ничего —
+            // это легальный исход idle-хода (таймер дал шанс, а она им
+            // не воспользовалась).
+            info!("[tg] модель промолчала (stay_quiet)");
+            (
+                "ОК: ты промолчала. В чат ничего не отправлено, ход завершён.".to_string(),
+                Vec::new(),
+            )
+        }
         "diary_page" => (
             "Инструмент diary_page недоступен в чате. Память консолидируется автоматически в режиме сна."
                 .to_string(),
@@ -653,7 +663,12 @@ pub async fn handle_new_message(
 
     // Живой статус: приходит живое сообщение от человека → на минуту "В сети".
     // Через тишину статус снова сбрасывается (см. timeout-ветку главного цикла).
-    client.set_online(true);
+    // Для idle-хода статус НЕ поднимаем: если она промолчит — она и не «в сети»
+    // (иначе мигание «в сети / не в сети» на пустом месте). Если написала —
+    // статус поднимет вызывающий код, по факту отправки.
+    if !is_idle {
+        client.set_online(true);
+    }
 
     // ── Ветка ФОТО (распознавание от юзера) ───────────────────────────────
     // messagePhoto: качаем photo.sizes[-1] (самый большой доступный размер,
@@ -810,6 +825,8 @@ pub async fn handle_new_message(
     let max_turns = 8;
     let mut ask_exhausted = false;
     let mut final_sent_via_tool = false;
+    // Модель САМА выбрала промолчать (stay_quiet) — ход закрывается тишиной.
+    let mut chose_quiet = false;
     // Инструментальный диалог ЭТОГО вызова (assistant tool_calls → tool-результаты).
     // Ничего с role=tool не должно попадать в tg_history: «осиротевший» tool
     // без предшествующего assistant.tool_calls роняет Mistral ошибкой
@@ -948,6 +965,12 @@ pub async fn handle_new_message(
         }
 
         if tool_calls.is_empty() {
+            // Idle-ход: инструмент не вызван — модель решила промолчать.
+            // НЕ пикаем её «обязана ответить»: это и есть спам по часам.
+            if is_idle {
+                info!("[tg] idle: модель промолчала (без tool_call)");
+                break;
+            }
             // Модель не вернула tool_call (бэкенд проигнорировал tool_choice).
             // Строго по принципу: сырой текст НЕ отправляем в чат. Даём
             // системную подсказку ролью user (безопасный порядок для Mistral:
@@ -1000,6 +1023,33 @@ pub async fn handle_new_message(
         let mut real_tool_done = false;
         for (call_idx, tc) in tool_calls.iter().enumerate() {
             let call_id = turn_calls[call_idx].id.clone();
+            if tc.function.name == "stay_quiet" {
+                if !is_idle {
+                    // На живое сообщение молчать нельзя — возвращаем модели:
+                    // ответь текстом или поставь реакцию.
+                    warn!("[tg] stay_quiet на живое сообщение — блокирую");
+                    turn_ctx.push(Message::tool_result(
+                        Some(call_id),
+                        Some("stay_quiet".to_string()),
+                        "ЗАПРЕЩЕНО: Саша написал тебе — нужно ответить (send_telegram_message) \
+                         или отреагировать (react_with_emoji). Молчать в ответ на живое сообщение \
+                         нельзя. Если писать нечего — поставь реакцию."
+                            .to_string(),
+                    ));
+                    continue;
+                }
+                // Idle-ход: модель САМА выбрала промолчать. В чат ничего не уходит.
+                // Остальные вызовы этого хода (если есть) обрабатываем как обычно —
+                // молчание не должно съесть уже подготовленное сообщение.
+                turn_ctx.push(Message::tool_result(
+                    Some(call_id),
+                    Some("stay_quiet".to_string()),
+                    "ОК: ты промолчала. В чат ничего не отправлено, ход завершён.".to_string(),
+                ));
+                info!("[tg] модель промолчала (stay_quiet)");
+                chose_quiet = true;
+                continue;
+            }
             // Голосовой ввод → ответ ТОЛЬКО голосом: скатываем send_telegram_message
             // и send_gif (гифка — тоже неволосовой ответ).
             if voice_text.is_some() && tc.function.name == "send_telegram_message" {
@@ -1102,6 +1152,11 @@ pub async fn handle_new_message(
                 ask_exhausted = true;
             }
         }
+        if chose_quiet {
+            // Ход закрылся тишиной: в чат ничего не ушло. Дальше — тишина.
+            debug!("[tg] ход завершён промолчанием");
+            break;
+        }
         let handled = real_tool_done;
 
         if final_sent_via_tool {
@@ -1110,6 +1165,11 @@ pub async fn handle_new_message(
         }
         if handled {
             if turn == max_turns {
+                if is_idle {
+                    // Idle: canned-реплика — это ровно тот «по часам» спам. Молчим.
+                    warn!("[tg] idle: лимит tool-loop — промолчали вместо canned-реплики");
+                    break;
+                }
                 warn!(
                     "[tg] достигнут лимит tool-loop ({}), отправляю fallback-ответ",
                     max_turns
@@ -1146,6 +1206,11 @@ pub async fn handle_new_message(
 
         // Если дошли сюда — ни один tool не отправил финал и не обработан.
         // (обычно не случается при tool_choice=required + send_telegram_message)
+        if is_idle {
+            // Idle: canned-реплика тут была бы «спамом по часам» — молчим.
+            warn!("[tg] idle: ни один tool не завершил ход — промолчали");
+            break;
+        }
         warn!("[tg] ни один tool не завершил ответ — fallback");
         let reply =
             "Сашенька, я тут немного зависла в мыслях... но я с тобой! 🥰 Расскажи ещё что-нибудь?";
@@ -1225,13 +1290,27 @@ pub async fn run_telegram_mode(
     let tg_system_prompt = prompts.build_system_prompt();
     let mut tg_history: Vec<Message> = vec![Message::system(tg_system_prompt.clone())];
     let mut last_user_activity = Instant::now();
+    // Активность ЛЮБАЯ (его сообщение ИЛИ наше собственное) — по ней
+    // считаем «совсем тихо» и решаем, когда уснуть.
+    let mut last_activity = Instant::now();
     let mut consolidated = false;
     // Для setOption online: НЕ чаще раза в минуту.
     let mut last_online_reset = Instant::now();
-    // Порог авто-консолидации: случайно 5–10 мин тишины юзера.
-    let consolidate_to: u64 = rand::thread_rng().gen_range(300..600);
+    // ── Инициатива: таймер НЕ диктует, а лишь даёт шанс ──────────────
     let idle_to = cfg.misc.idle_message_timeout_secs;
     let sleep_to = cfg.misc.sleep_timeout_secs;
+    let idle_window_min = cfg.misc.idle_window_min_secs.max(60);
+    let idle_window_max = cfg.misc.idle_window_max_secs.max(idle_window_min);
+    let idle_ping_max = cfg.misc.idle_ping_max.max(1);
+    let idle_policy = crate::idle::IdlePolicy::new(idle_window_min, idle_window_max, idle_ping_max);
+    // next_idle_at — момент, когда можно ПРЕДЛОЖИТЬ ей написать первой.
+    // Дальше решает модель: пишет или зовёт stay_quiet (молчит). Окно
+    // каждый раз случайное — чтобы не выходило «ровно как по часам».
+    let mut next_idle_at = Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+    // Сколько своих инициативных сообщений подряд можно оставить без ответа.
+    let mut idle_pings: u32 = 0;
+    // Уснула: пока первыми не пишем (проснётся на его сообщение).
+    let mut asleep = false;
     let papik = cfg.general.papik_chat_id;
     let mut tg_history_full: Vec<(i64, bool, String, i64)> = Vec::new();
     let mut history_from_id: i64;
@@ -1405,103 +1484,57 @@ pub async fn run_telegram_mode(
                         }
                         continue;
                     }
-                    let elapsed = last_user_activity.elapsed().as_secs();
+                    let elapsed_user = last_user_activity.elapsed().as_secs();
+                    let elapsed_any = last_activity.elapsed().as_secs();
                     // Статус "в сети" сбрасываем после 2 мин тишины (не чаще
                     // раза в минуту — setOption не дёргаем каждые 200мс).
                     // СТАРТ: true никогда не было (offline после Ready).
-                    if elapsed >= 120 && last_online_reset.elapsed() >= Duration::from_secs(60) {
+                    if elapsed_user >= 120
+                        && last_online_reset.elapsed() >= Duration::from_secs(60)
+                    {
                         last_online_reset = Instant::now();
                         client.set_online(false);
-                        info!("[tg][debug] статус: offline (тишина {}с)", elapsed);
+                        info!("[tg][debug] статус: offline (тишина {}с)", elapsed_user);
                     }
-                    // Авто-консолидация через 5–10 мин тишины юзера (без сообщения).
-                    if !consolidated && elapsed >= consolidate_to {
-                        info!(
-                            "[tg] авто-консолидация (тишина юзера {}с >= {}с)",
-                            elapsed, consolidate_to
-                        );
-                        let chat_turns: Vec<furinya_diary::ChatTurn> = furinya_diary::ChatTurn::from_tg_full(
-                            &tg_history_full,
-                            &cfg.general.character_name,
-                            &cfg.general.papik_name,
-                        );
-                        let n = match consolidate_memory(
-                            llm,
-                            diary,
-                            prompts,
-                            diary_entries,
-                            &cfg.misc.diary_dir,
-                            &chat_turns,
-                            papik,
-                            cfg.misc.diary_keep_last,
-                            cfg.misc.active_top_k,
-                        )
-                        .await
-                        {
-                            Ok(n) => n,
-                            Err(e) => {
-                                error!("[tg] consolidate ошибка: {}", e);
-                                0
-                            }
-                        };
-                        *diary_entries = diary.load_all()?;
-                        info!("[tg] сконсолидировано {} записей (тихо)", n);
-                        consolidated = true;
-                        // Следующая проверка памяти — рандомайзер ~30 мин (30±10).
-                        let initiative_to =
-                            consolidate_to + rand::thread_rng().gen_range(1800..2400);
-                        last_user_activity = Instant::now()
-                            .checked_sub(std::time::Duration::from_secs(
-                                initiative_to.saturating_sub(elapsed),
-                            ))
-                            .unwrap_or_else(Instant::now);
-                        info!(
-                            "[tg] следующая инициатива через ~{}с",
-                            initiative_to - consolidate_to
-                        );
-                    } else if consolidated && elapsed >= sleep_to {
-                        // Долгое молчание после консолидации — уходим спать.
-                        // Спящие реплики — не хардкод: это МЫСЛЬ модели, как
-                        // idle-инициатива (правка Саши). Стимул → tool-loop →
-                        // она сама решает попрощаться или молча пропасть.
-                        info!(
-                            "[tg] режим сна (тишина юзера {}с >= {}с)",
-                            elapsed, sleep_to
-                        );
-                        if rand::thread_rng().gen_bool(2.0 / 3.0) {
-                            let stim = serde_json::json!({
-                                "@type": "updateNewMessage",
-                                "message": {
-                                    "chat_id": papik,
-                                    "id": 0,
-                                    "sender_id": { "user_id": 0 },
-                                    "content": { "text": { "text": "[сон] Тишина затянулась, глазки слипаются. Придумай сама: короткое живое сообщение, что уходишь дремать (1-2 части, своя формулировка, без громких прощаний) — либо отреагируй эмодзи (зевок/сон) и уйди молча. Это просто момент, не драма." } }
-                                }
-                            });
-                            handle_new_message(
-                                stim,
+                    // ── СОН: давно тихо (и его, и нас) ─────────────────────
+                    // Консолидация по правилу Саши: только перед сном или при
+                    // context overflow (см. после handle_new_message).
+                    if !asleep && elapsed_any >= sleep_to {
+                        // Уходим спать: сначала тихая консолидация (если ещё не
+                        // консолидировали на этом цикле), затем модель САМА
+                        // решает — сказать «ухожу дремать» или промолчать
+                        // (stay_quiet). Хардкода нет.
+                        if !consolidated {
+                            consolidated = true;
+                            let chat_turns: Vec<furinya_diary::ChatTurn> =
+                                furinya_diary::ChatTurn::from_tg_full(
+                                    &tg_history_full,
+                                    &cfg.general.character_name,
+                                    &cfg.general.papik_name,
+                                );
+                            match consolidate_memory(
                                 llm,
-                                &client,
                                 diary,
                                 prompts,
                                 diary_entries,
-                                &mut tg_history,
-                                &mut tg_history_full,
-                                &tg_system_prompt,
-                                cfg,
-                                my_id,
-                                // is_idle=true: тесты reader-ловушек не сработают,
-                                // спящий-реплика — это инициативный ход.
-                                true,
-                            ).await;
+                                &cfg.misc.diary_dir,
+                                &chat_turns,
+                                papik,
+                                cfg.misc.diary_keep_last,
+                                cfg.misc.active_top_k,
+                            )
+                            .await
+                            {
+                                Ok(n) => {
+                                    *diary_entries = diary.load_all()?;
+                                    info!("[tg] консолидация перед сном: {} записей", n);
+                                }
+                                Err(e) => error!("[tg] consolidate ошибка: {}", e),
+                            }
                         }
-                        last_user_activity = Instant::now();
-                        consolidated = false;
-                    } else if consolidated && elapsed >= idle_to {
-                        // Рандомайзер сработал: модель сама решает проявить инициативу.
                         info!(
-                            "[tg] idle-инициатива (тишина юзера {}с >= {}с)",
-                            elapsed, idle_to
+                            "[tg] режим сна (тишина {}с >= {}с)",
+                            elapsed_any, sleep_to
                         );
                         let stim = serde_json::json!({
                             "@type": "updateNewMessage",
@@ -1509,12 +1542,58 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": "[idle] Furinya, напиши что-нибудь сама — уже давно молчим. Прояви инициативу, напиши что-то милое или спроси о делах. НЕ забудь после общения при необходимости освежить память." } }
+                                "content": { "text": { "text": format!("[сон] [внутреннее] Тишина затянулась ({} минут). Ты устала и можешь уйти дремать. Реши сама: сказать короткое «ухожу дремать / спокойной ночи» (одна часть, своими словами, без громких прощаний и без «жаль что ты молчишь») — или просто промолчать (stay_quiet). Это тихий момент, не драма.", elapsed_any / 60) } }
                             }
                         });
-                        last_user_activity = Instant::now()
-                            .checked_sub(std::time::Duration::from_secs(idle_to.saturating_sub(60)))
-                            .unwrap_or_else(Instant::now);
+                        let before = tg_history_full.len();
+                        handle_new_message(
+                            stim,
+                            llm,
+                            &client,
+                            diary,
+                            prompts,
+                            diary_entries,
+                            &mut tg_history,
+                            &mut tg_history_full,
+                            &tg_system_prompt,
+                            cfg,
+                            my_id,
+                            // is_idle=true: тесты reader-ловушек не сработают,
+                            // спящая реплика — это инициативный ход.
+                            true,
+                        )
+                        .await;
+                        if tg_history_full.len() > before {
+                            client.set_online(true);
+                        }
+                        // Уснула: первыми больше не пишем, пока он не напишет.
+                        asleep = true;
+                        idle_pings = 0;
+                        last_activity = Instant::now();
+                        next_idle_at = Instant::now()
+                            + Duration::from_secs(idle_policy.window_max.saturating_mul(4));
+                        continue;
+                    }
+                    // ── Шанс написать первой ──────────────────────────────
+                    // Таймер НЕ пикает «надо ответить»: он лишь даёт шанс.
+                    // Дальше решает модель — написать или промолчать.
+                    if idle_policy.may_offer(asleep, idle_pings)
+                        && Instant::now() >= next_idle_at
+                    {
+                        info!(
+                            "[tg] idle-шанс (тишина {}с, своих сообщений без ответа {}/{})",
+                            elapsed_any, idle_pings, idle_policy.ping_max
+                        );
+                        let stim = serde_json::json!({
+                            "@type": "updateNewMessage",
+                            "message": {
+                                "chat_id": papik,
+                                "id": 0,
+                                "sender_id": { "user_id": 0 },
+                                "content": { "text": { "text": format!("[idle] [внутреннее] Тишина: Саша не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если нечего сказать или не хочется — вызови stay_quiet и промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.", elapsed_any / 60) } }
+                            }
+                        });
+                        let before = tg_history_full.len();
                         handle_new_message(
                             stim,
                             llm,
@@ -1530,6 +1609,25 @@ pub async fn run_telegram_mode(
                             true,
                         )
                         .await;
+                        if tg_history_full.len() > before {
+                            // Написала первой: считаем это своей активностью.
+                            idle_pings += 1;
+                            last_activity = Instant::now();
+                            client.set_online(true);
+                            // Следующий шанс — заметно позже: человек не пишет
+                            // «а ты тут?» сразу после своего сообщения.
+                            next_idle_at =
+                                Instant::now() + Duration::from_secs(idle_policy.next_delay(true));
+                            info!(
+                                "[tg] idle: написала первой ({} без ответа)",
+                                idle_pings
+                            );
+                        } else {
+                            // Промолчала: активности не было, ждём дальше.
+                            next_idle_at =
+                                Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+                            info!("[tg] idle: промолчала — следующий шанс позже");
+                        }
                     }
                     continue;
                 }
@@ -1548,7 +1646,14 @@ pub async fn run_telegram_mode(
             let out_sender = v["message"]["sender_id"]["user_id"].as_i64().unwrap_or(0);
             if out_sender != my_id {
                 last_user_activity = Instant::now();
+                last_activity = Instant::now();
+                // Проснулась: его сообщение снимает сон и обнуляет счётчик
+                // наших инициативных сообщений без ответа.
+                asleep = false;
+                idle_pings = 0;
                 consolidated = false;
+                // Следующий шанс написать первой — снова случайный.
+                next_idle_at = Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
             }
         }
         let t = v.get("@type").and_then(|x| x.as_str()).unwrap_or("");
@@ -1600,6 +1705,71 @@ pub async fn run_telegram_mode(
                     false,
                 )
                 .await;
+                // Context overflow → консолидация + подрезка истории
+                // (правило Саши: консолидация во сне ИЛИ при overflow).
+                // Порог: diary_token_count_trigger (токенов) × 4 символа.
+                let overflow_limit =
+                    cfg.misc.diary_token_count_trigger as usize * 4;
+                let total_chars: usize = tg_history_full
+                    .iter()
+                    .map(|(_, _, t, _)| t.chars().count())
+                    .sum();
+                if !consolidated && total_chars >= overflow_limit {
+                    info!("[tg] overflow: {} симв >= {} — консолидация", total_chars, overflow_limit);
+                    consolidated = true;
+                    let chat_turns: Vec<furinya_diary::ChatTurn> =
+                        furinya_diary::ChatTurn::from_tg_full(
+                            &tg_history_full,
+                            &cfg.general.character_name,
+                            &cfg.general.papik_name,
+                        );
+                    match consolidate_memory(
+                        llm,
+                        diary,
+                        prompts,
+                        diary_entries,
+                        &cfg.misc.diary_dir,
+                        &chat_turns,
+                        cfg.general.papik_chat_id,
+                        cfg.misc.diary_keep_last,
+                        cfg.misc.active_top_k,
+                    )
+                    .await
+                    {
+                        Ok(n) => {
+                            *diary_entries = diary.load_all()?;
+                            info!("[tg] overflow-консолидация: {} записей", n);
+                        }
+                        Err(e) => error!("[tg] overflow-консолидация ошибка: {}", e),
+                    }
+                    // Подрезка: хвост остаётся, старьё уходит в дневник.
+                    const KEEP_LAST: usize = 40;
+                    if tg_history_full.len() > KEEP_LAST {
+                        let drop = tg_history_full.len() - KEEP_LAST;
+                        tg_history_full.drain(..drop);
+                    }
+                    // tg_history — живой хвост: system + последние recent_limit.
+                    let rr = cfg.general.tg_recent_limit.max(1);
+                    let tl_start = tg_history_full.len().saturating_sub(rr);
+                    let mut hist = vec![Message::system(tg_system_prompt.clone())];
+                    for (sender, is_me, text, date) in &tg_history_full[tl_start..] {
+                        let who = if *is_me {
+                            cfg.general.character_name.clone()
+                        } else if *sender == cfg.general.papik_chat_id {
+                            cfg.general.papik_name.clone()
+                        } else {
+                            format!("user{}", sender)
+                        };
+                        let line = format!("[{}] {}: {}", format_ts(*date), who, text);
+                        if *is_me {
+                            hist.push(Message::assistant(line));
+                        } else {
+                            hist.push(Message::user(line));
+                        }
+                    }
+                    tg_history = hist;
+                    info!("[tg] история подрезана: {} записей, контекст {}", tg_history_full.len(), tg_history.len());
+                }
             }
             "updateConnectionState" => {
                 let state = v["state"]["@type"].as_str().unwrap_or("?");

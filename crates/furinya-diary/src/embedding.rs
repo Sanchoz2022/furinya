@@ -37,10 +37,30 @@ impl EmbeddingClient {
         } else {
             cfg.bearer_key.clone()
         };
+        // Страховка от тихой поломки: без модели Mistral отвечает
+        // 400 «Invalid model: None», и консолидация откатывается в ноль.
+        // Пустая модель → дефолт (или env MISTRAL_EMBED_MODEL).
+        let model = if cfg.model.trim().is_empty() {
+            let m = std::env::var("MISTRAL_EMBED_MODEL")
+                .unwrap_or_else(|_| "mistral-embed-2312".to_string());
+            tracing::warn!(
+                "[embed] модель эмбеддингов не задана в конфиге (endpoint.model) — беру {}",
+                m
+            );
+            m
+        } else {
+            cfg.model.clone()
+        };
+        let base_url = if cfg.base_url.trim().is_empty() {
+            tracing::warn!("[embed] endpoint.baseUrl не задан — беру https://api.mistral.ai/v1/");
+            "https://api.mistral.ai/v1".to_string()
+        } else {
+            cfg.base_url.trim_end_matches('/').to_string()
+        };
         Self {
-            base_url: cfg.base_url.trim_end_matches('/').to_string(),
+            base_url,
             bearer_key: bearer,
-            model: cfg.model.clone(),
+            model,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
