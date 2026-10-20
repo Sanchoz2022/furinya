@@ -203,6 +203,32 @@ fn record_my_send(
     }
 }
 
+/// Последние собственные реплики персонажа — подсказка «не повторяйся»
+/// для idle/сон-стимулов (без неё модель повторяет одну строчку).
+fn own_recent_quotes(
+    history: &[(i64, bool, String, i64)],
+    n: usize,
+) -> String {
+    let own: Vec<String> = history
+        .iter()
+        .filter(|(_, is_me, t, _)| *is_me && !t.trim().is_empty())
+        .rev()
+        .take(n)
+        .map(|(_, _, t, _)| t.chars().take(90).collect::<String>())
+        .collect();
+    if own.is_empty() {
+        return String::new();
+    }
+    format!(
+        " Твои последние реплики: {}. НЕ повторяй их и не пиши снова «я тут, жду тебя» — \
+         это уже было. Скажи что-то НОВОЕ — или промолчи.",
+        own.iter()
+            .map(|s| format!("«{s}»"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// Исполняет TG-инструмент (send_telegram_message / react_with_emoji / ask / ...).
 /// Возвращает `(результат, отправленное)`:
 /// - результат — текст для tool-ответа модели;
@@ -1299,7 +1325,8 @@ pub async fn run_telegram_mode(
     // ── Инициатива: таймер НЕ диктует, а лишь даёт шанс ──────────────
     let idle_to = cfg.misc.idle_message_timeout_secs;
     let sleep_to = cfg.misc.sleep_timeout_secs;
-    let idle_window_min = cfg.misc.idle_window_min_secs.max(60);
+    // Пол-секунды — чтобы ускоренные прогоны (окно 5-12с) работали.
+    let idle_window_min = cfg.misc.idle_window_min_secs.max(5);
     let idle_window_max = cfg.misc.idle_window_max_secs.max(idle_window_min);
     let idle_ping_max = cfg.misc.idle_ping_max.max(1);
     let idle_policy = crate::idle::IdlePolicy::new(idle_window_min, idle_window_max, idle_ping_max);
@@ -1313,6 +1340,8 @@ pub async fn run_telegram_mode(
     let mut asleep = false;
     let papik = cfg.general.papik_chat_id;
     let mut tg_history_full: Vec<(i64, bool, String, i64)> = Vec::new();
+    // id уже загруженных сообщений — защита от дублей при пагинации.
+    let mut history_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut history_from_id: i64;
     let history_load_limit = cfg.general.tg_history_load_limit.max(50);
 
@@ -1352,12 +1381,24 @@ pub async fn run_telegram_mode(
         let v = if idle_to > 0 {
             match update_loop.updates.recv_timeout(Duration::from_millis(200)) {
                 Ok(v) => {
+                    // TDLib 1.8.62 на searchChatMessages отвечает объектом
+                    // «foundChatMessages» (а не «messages», как в старых
+                    // версиях). Раньше ждали только «messages» — история чата
+                    // НИКОГДА не грузилась: пустой контекст на старте и пустая
+                    // консолидация («диалог пустой/коротый»).
                     if v.get("@extra").and_then(|e| e.as_str()) == Some("history_load")
-                        && v.get("@type").and_then(|t| t.as_str()) == Some("messages")
+                        && matches!(
+                            v.get("@type").and_then(|t| t.as_str()),
+                            Some("messages") | Some("foundChatMessages")
+                        )
                     {
                         let msgs = v.get("messages").and_then(|m| m.as_array());
                         if let Some(msgs) = msgs {
                             let mut loaded: Vec<(i64, bool, String, i64)> = Vec::new();
+                            // id сообщений страницы — для пагинации (from_message_id)
+                            // и для защиты от дублей (TDLib может прислать
+                            // перекрывающиеся страницы).
+                            let mut page_ids: Vec<i64> = Vec::new();
                             for m in msgs {
                                 let sender = m
                                     .get("sender_id")
@@ -1372,9 +1413,14 @@ pub async fn run_telegram_mode(
                                     .unwrap_or("")
                                     .to_string();
                                 let date = m.get("date").and_then(|d| d.as_i64()).unwrap_or(0);
+                                let mid = m.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
                                 if text.trim().is_empty() {
                                     continue;
                                 }
+                                if mid != 0 && !history_ids.insert(mid) {
+                                    continue; // уже загружено
+                                }
+                                page_ids.push(mid);
                                 loaded.push((
                                     sender,
                                     sender == cfg.general.telegram_my_id,
@@ -1383,11 +1429,19 @@ pub async fn run_telegram_mode(
                                 ));
                             }
                             loaded.reverse();
+                            page_ids.reverse();
                             tg_history_full.extend(loaded.clone());
                             // Пагинация: если ещё не набрали лимит и страница была полной (100) — грузим следующую.
                             if tg_history_full.len() < history_load_limit && loaded.len() >= 100 {
-                                history_from_id =
-                                    loaded.first().map(|(id, _, _, _)| *id).unwrap_or(0);
+                                // ВАЖНО: from_message_id — это id СООБЩЕНИЯ (самый
+                                // старый на странице), а НЕ sender_id. Раньше туда
+                                // клали sender — пагинация ломалась.
+                                history_from_id = page_ids
+                                    .iter()
+                                    .copied()
+                                    .min()
+                                    .filter(|id| *id > 0)
+                                    .unwrap_or(0);
                                 client.search_chat_messages(
                                     cfg.general.papik_chat_id,
                                     history_from_id,
@@ -1542,7 +1596,7 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[сон] [внутреннее] Тишина затянулась ({} минут). Ты устала и можешь уйти дремать. Реши сама: сказать короткое «ухожу дремать / спокойной ночи» (одна часть, своими словами, без громких прощаний и без «жаль что ты молчишь») — или просто промолчать (stay_quiet). Это тихий момент, не драма.", elapsed_any / 60) } }
+                                "content": { "text": { "text": format!("[сон] [внутреннее] Тишина затянулась ({} минут). Ты устала и можешь уйти дремать. Реши сама: сказать короткое «ухожу дремать / спокойной ночи» (одна часть, своими словами, без громких прощаний и без «жаль что ты молчишь») — или просто промолчать (stay_quiet). Это тихий момент, не драма.{}", elapsed_any / 60, own_recent_quotes(&tg_history_full, 2)) } }
                             }
                         });
                         let before = tg_history_full.len();
@@ -1584,13 +1638,16 @@ pub async fn run_telegram_mode(
                             "[tg] idle-шанс (тишина {}с, своих сообщений без ответа {}/{})",
                             elapsed_any, idle_pings, idle_policy.ping_max
                         );
+                        // Её собственные последние реплики — иначе модель повторяет
+                        // одну и ту же строчку («я тут, жду тебя») из хода в ход.
+                        let own_hint = own_recent_quotes(&tg_history_full, 3);
                         let stim = serde_json::json!({
                             "@type": "updateNewMessage",
                             "message": {
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[idle] [внутреннее] Тишина: Саша не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если нечего сказать или не хочется — вызови stay_quiet и промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.", elapsed_any / 60) } }
+                                "content": { "text": { "text": format!("[idle] [внутреннее] Тишина: Саша не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если нечего сказать или не хочется — вызови stay_quiet и промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.{}", elapsed_any / 60, own_hint) } }
                             }
                         });
                         let before = tg_history_full.len();

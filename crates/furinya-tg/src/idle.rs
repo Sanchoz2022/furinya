@@ -23,7 +23,8 @@ pub struct IdlePolicy {
 
 impl IdlePolicy {
     pub fn new(window_min: u64, window_max: u64, ping_max: u32) -> Self {
-        let window_min = window_min.max(60);
+        // Пол 5с (не 60): чтобы ускоренные прогоны с коротким окном работали.
+        let window_min = window_min.max(5);
         let window_max = window_max.max(window_min);
         Self {
             window_min,
@@ -95,7 +96,7 @@ mod tests {
     #[test]
     fn windows_are_sanitized() {
         let p = IdlePolicy::new(0, 10, 0);
-        assert!(p.window_min >= 60);
+        assert!(p.window_min >= 5);
         assert!(p.window_max >= p.window_min);
         assert!(p.ping_max >= 1);
     }
