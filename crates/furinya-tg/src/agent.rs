@@ -255,6 +255,37 @@ fn budgeted_block(parts: &[String], budget: usize) -> String {
     out
 }
 
+/// Извлекает факты о собеседнике из per-чат выжимок в векторную память (RAG).
+///
+/// Без этого шага дневник остаётся пустым: консолидация только ПЕРЕЖИМАЕТ
+/// старые записи, а новых знаний не создаёт. Факты берутся из файла
+/// `data/diary/chat_history/<chat_id>.md`, который обновляет консолидация.
+async fn extract_facts_to_diary(
+    llm: &LlmClient,
+    diary: &Diary,
+    prompts: &Prompts,
+    diary_entries: &mut Vec<furinya_diary::Entry>,
+    cfg: &Config,
+) {
+    match furinya_diary::build_profile_memory(
+        llm,
+        diary,
+        prompts,
+        &cfg.misc.diary_dir,
+        diary_entries,
+        cfg.misc.diary_keep_last,
+        cfg.misc.active_top_k,
+    )
+    .await
+    {
+        Ok(n) => {
+            *diary_entries = diary.load_all().unwrap_or_default();
+            info!("[tg] факты в память (RAG): {} записей", n);
+        }
+        Err(e) => error!("[tg] извлечение фактов ошибка: {}", e),
+    }
+}
+
 /// Исполняет TG-инструмент (send_telegram_message / react_with_emoji / ask / ...).
 /// Возвращает `(результат, отправленное)`:
 /// - результат — текст для tool-ответа модели;
@@ -1776,6 +1807,12 @@ pub async fn run_telegram_mode(
                                     *diary_entries = diary.load_all()?;
                                     info!("[tg] консолидация перед сном: {} записей", n);
                                     last_consolidated_history_len = tg_history_full.len();
+                                    // Профиль/выжимка обновились — извлекаем из них
+                                    // ФАКТЫ в векторную память (RAG). Без этого
+                                    // дневник остаётся пустым: консолидация только
+                                    // пережимает старые записи, новых не создаёт.
+                                    extract_facts_to_diary(llm, diary, prompts, diary_entries, cfg)
+                                        .await;
                                 }
                                 Err(e) => error!("[tg] consolidate ошибка: {}", e),
                             }
@@ -2005,6 +2042,8 @@ pub async fn run_telegram_mode(
                         Ok(n) => {
                             *diary_entries = diary.load_all()?;
                             info!("[tg] overflow-консолидация: {} записей", n);
+                            // Факты из обновлённой выжимки → в векторную память (RAG).
+                            extract_facts_to_diary(llm, diary, prompts, diary_entries, cfg).await;
                         }
                         Err(e) => error!("[tg] overflow-консолидация ошибка: {}", e),
                     }

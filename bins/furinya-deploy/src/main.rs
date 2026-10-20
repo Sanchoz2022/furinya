@@ -360,10 +360,12 @@ fn build_payload(a: &Args, stage: &Path) -> Result<()> {
         fs::copy(&cfg, stage.join("payload/config.toml"))?;
     }
 
-    // 5) сессия Telegram + память
+    // 5) сессия Telegram + память — в отдельный каталог `seed/`.
+    //    На сервере данные НЕ затираются: если у контейнера уже есть
+    //    data/tdlib_db (своя сессия и накопленная память) — seed игнорируется.
     for (src, dst) in [
-        ("data/tdlib_db", "payload/data/tdlib_db"),
-        ("data/diary", "payload/data/diary"),
+        ("data/tdlib_db", "payload/seed/data/tdlib_db"),
+        ("data/diary", "payload/seed/data/diary"),
     ] {
         let s = root.join(src);
         if s.exists() {
@@ -576,7 +578,7 @@ fn main() -> Result<()> {
         a.lxc_id
     ))?;
     remote.must(&format!(
-        "pct exec {} -- bash -c 'rm -rf {APP_DIR} && mkdir -p {APP_DIR} && tar xf /tmp/payload.tar -C {APP_DIR} && rm -f /tmp/payload.tar'",
+        "pct exec {} -- bash -c 'rm -rf {APP_DIR}/prompts {APP_DIR}/libs {APP_DIR}/seed {APP_DIR}/furinya {APP_DIR}/config.toml {APP_DIR}/.env {APP_DIR}/furinya.service {APP_DIR}/mihomo.service {APP_DIR}/mihomo.yaml {APP_DIR}/mihomo && mkdir -p {APP_DIR} && tar xf /tmp/payload.tar -C {APP_DIR} && rm -f /tmp/payload.tar'",
         a.lxc_id
     ))?;
 
@@ -586,6 +588,12 @@ fn main() -> Result<()> {
         r#"
 set -e
 id furinya >/dev/null 2>&1 || useradd -m -s /bin/bash furinya
+# Данные (сессия Telegram + накопленная память) НЕ затираем: seed кладём
+# только если их ещё нет (свежий LXC).
+if [ ! -d {APP_DIR}/data/tdlib_db ] && [ -d {APP_DIR}/seed/data ]; then
+  mv {APP_DIR}/seed/data {APP_DIR}/data
+fi
+rm -rf {APP_DIR}/seed
 chown -R furinya:furinya {APP_DIR}
 chmod 600 {APP_DIR}/.env
 chmod 700 {APP_DIR}/data/tdlib_db 2>/dev/null || true
