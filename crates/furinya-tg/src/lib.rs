@@ -311,6 +311,105 @@ impl TdClient {
         }));
     }
 
+    /// Настраивает прокси для TDLib (нужен там, где Telegram режут по IP).
+    ///
+    /// Схема TDLib 1.8.62 (взяснена пробником probe_proxy):
+    ///   1. `getProxies` → ищем существующий прокси по server:port;
+    ///   2. `addProxy` с ВЛОЖЕННЫМ объектом "proxy" → ответ `addedProxy`
+    ///      с целочисленным id (класса "proxySettings" в 1.8.62 нет!);
+    ///   3. `enableProxy` с параметром `proxy_id` → прокси включается.
+    ///
+    /// Формат URL: `socks5://host:port` или `http://host:port`.
+    pub async fn configure_proxy(&self, url: &str) -> anyhow::Result<()> {
+        let url = url.trim();
+        let (kind, hostport) = if let Some(rest) = url.strip_prefix("socks5://") {
+            ("proxyTypeSocks5", rest.trim_end_matches('/').to_string())
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            ("proxyTypeHttp", rest.trim_end_matches('/').to_string())
+        } else {
+            anyhow::bail!("не понимаю прокси '{url}' (нужен socks5:// или http://)");
+        };
+        let (host, port) = hostport
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("в прокси нет порта: {hostport}"))?;
+        let port: i64 = port
+            .parse()
+            .map_err(|_| anyhow::anyhow!("порт прокси не число: {port}"))?;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+
+        // 1) Ищем уже сохранённый прокси (они живут в базе TDLib).
+        let extra = format!("getproxies_{nanos}");
+        let list = self
+            .query_td(
+                serde_json::json!({ "@type": "getProxies" }),
+                &extra,
+                Duration::from_secs(20),
+            )
+            .await?;
+        let proxies = list
+            .get("proxies")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let existing = proxies.iter().find_map(|p| {
+            let id = p.get("id").and_then(|i| i.as_i64())?;
+            let pr = p.get("proxy")?;
+            let same = pr.get("server").and_then(|s| s.as_str()) == Some(host)
+                && pr.get("port").and_then(|x| x.as_i64()) == Some(port);
+            same.then_some(id)
+        });
+
+        // 2) Нет — добавляем.
+        let proxy_id = match existing {
+            Some(id) => {
+                info!("[tg] прокси {host}:{port} уже есть в TDLib (id={id})");
+                id
+            }
+            None => {
+                let extra = format!("addproxy_{nanos}");
+                let resp = self
+                    .query_td(
+                        serde_json::json!({
+                            "@type": "addProxy",
+                            "proxy": {
+                                "server": host,
+                                "port": port,
+                                "type": { "@type": kind }
+                            }
+                        }),
+                        &extra,
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                let id = resp
+                    .get("id")
+                    .and_then(|x| x.as_i64())
+                    .ok_or_else(|| anyhow::anyhow!("addProxy вернул не прокси: {resp}"))?;
+                info!("[tg] прокси добавлен в TDLib: {host}:{port} ({kind}), id={id}");
+                id
+            }
+        };
+
+        // 3) Включаем (иначе TDLib продолжает ходить напрямую).
+        let extra = format!("enableproxy_{nanos}");
+        let resp = self
+            .query_td(
+                serde_json::json!({ "@type": "enableProxy", "proxy_id": proxy_id }),
+                &extra,
+                Duration::from_secs(20),
+            )
+            .await?;
+        if resp.get("@type").and_then(|v| v.as_str()) == Some("error") {
+            anyhow::bail!("enableProxy: {resp}");
+        }
+        info!("[tg] прокси для Telegram включён: {host}:{port} ({kind})");
+        Ok(())
+    }
+
     /// Управляет статусом "в сети" (TDLib option "online"). Ошибкам TDLib
     /// тоже всё равно — option может отсутствовать, тогда просто не сработает.
     /// Используем: offline по умолчанию (Саша не хочет вечного "В сети"),
@@ -400,7 +499,7 @@ impl TdClient {
     }
 
     /// Общий запрос-ответ: шлёт метод с @extra и ждёт ответ через pending_queries.
-    async fn query_td(&self, mut req: Value, extra: &str, timeout: Duration) -> anyhow::Result<Value> {
+    pub async fn query_td(&self, mut req: Value, extra: &str, timeout: Duration) -> anyhow::Result<Value> {
         let (tx, rx) = oneshot::channel::<Value>();
         self.pending_queries.lock().unwrap().insert(extra.to_string(), tx);
         req["@extra"] = serde_json::json!(extra);

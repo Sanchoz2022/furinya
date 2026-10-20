@@ -1352,6 +1352,32 @@ pub async fn run_telegram_mode(
     )? {
         crate::auth::AuthState::Ready => {
             info!("[tg] готов к приёму сообщений");
+            // Прокси для Telegram настраиваем ПОСЛЕ setTdlibParameters: до
+            // этого TDLib не отвечает на запросы (висит на инициализации) —
+            // getProxies/addProxy уходили в таймаут.
+            if let Ok(tg_proxy) = std::env::var("FURINYA_TG_PROXY") {
+                if !tg_proxy.trim().is_empty() {
+                    let mut ok = false;
+                    for attempt in 1..=3 {
+                        match client.configure_proxy(&tg_proxy).await {
+                            Ok(()) => {
+                                ok = true;
+                                break;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[tg] прокси Telegram: попытка {attempt} не удалась ({})",
+                                    e
+                                );
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
+                    if !ok {
+                        error!("[tg] прокси Telegram НЕ настроен — бот может не достучаться до Telegram");
+                    }
+                }
+            }
             // Статус "В сети" НЕ держим постоянно (просьба Саши): стартуем
             // offline, включается на время живого общения (см. handle_new_message).
             client.set_online(false);

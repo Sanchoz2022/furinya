@@ -135,6 +135,9 @@ fi
   # NO_PROXY — чтобы sd-сервер и локалка шли напрямую, мимо прокси.
   echo "HTTP_PROXY=http://127.0.0.1:${MIX_PORT}"
   echo "HTTPS_PROXY=http://127.0.0.1:${MIX_PORT}"
+  # Telegram для TDLib — отдельный SOCKS5 на том же mixed-порту: с IP
+  # провайдера t.me/DC не отвечают, без прокси бот «молчит».
+  echo "FURINYA_TG_PROXY=socks5://127.0.0.1:${MIX_PORT}"
   echo "NO_PROXY=127.0.0.1,localhost,${SD_IP:-192.168.1.172},192.168.1.0/24,10.0.0.0/8"
   echo "FURINYA_TD_QUIET=1"
 } > "$STAGE/payload/.env"
