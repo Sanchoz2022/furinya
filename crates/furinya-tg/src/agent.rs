@@ -12,7 +12,7 @@ use furinya_diary::{
     Diary, Entry, active_context, consolidate_memory, read_active,
 };
 use furinya_llm::{
-    LlmClient, Message, ToolCall, build_tools, extract_thinking, extract_thinking_from_content,
+    LlmClient, Message, Role, ToolCall, build_tools, extract_thinking, extract_thinking_from_content,
 };
 use furinya_vision::describe_photo;
 use furinya_audio::{synthesize_speech_openai, synthesize_fish_voice, transcribe_audio};
@@ -994,6 +994,17 @@ pub async fn handle_new_message(
         // Инструментальный контекст текущего вызова — строго в порядке:
         // assistant(tool_calls) → tool(результат).
         messages.extend(turn_ctx.iter().cloned());
+        // Mistral отвергает запрос, который заканчивается «голым» assistant
+        // (без tool_calls) — 400 invalid_request_message_order. Так бывает,
+        // когда хвост истории заканчивается её собственной репликой, а
+        // инструментального контекста в этом ходе нет.
+        if messages
+            .last()
+            .map(|m| m.role == Role::Assistant && m.tool_calls.is_none())
+            .unwrap_or(false)
+        {
+            messages.pop();
+        }
         if turn == 1 && is_idle {
             // Idle-стимул не пишется в живую историю — добавляем в запрос напрямую.
             messages.push(Message::user(effective_text.clone()));
