@@ -1472,6 +1472,9 @@ pub async fn run_telegram_mode(
     // кэш (часто 1 сообщение), а полный список с сервера приходит позже.
     let mut history_attempts: u32 = 0;
     let mut history_retry_at: Option<Instant> = None;
+    // Сколько сообщений истории накопилось с прошлой консолидации — по нему
+    // ловится «переполнение» при живой переписке.
+    let mut last_consolidated_history_len: usize = 0;
     let history_load_limit = cfg.general.tg_history_load_limit.max(50);
 
     // Локальный stdin — единственный путь к тех. командам (consolidate / memory build / save / exit).
@@ -1762,6 +1765,7 @@ pub async fn run_telegram_mode(
                                 Ok(n) => {
                                     *diary_entries = diary.load_all()?;
                                     info!("[tg] консолидация перед сном: {} записей", n);
+                                    last_consolidated_history_len = tg_history_full.len();
                                 }
                                 Err(e) => error!("[tg] consolidate ошибка: {}", e),
                             }
@@ -1951,15 +1955,23 @@ pub async fn run_telegram_mode(
                 .await;
                 // Context overflow → консолидация + подрезка истории
                 // (правило Саши: консолидация во сне ИЛИ при overflow).
-                // Порог: diary_token_count_trigger (токенов) × 4 символа.
+                // Два триггера:
+                //   1) история выросла на 20+ сообщений с прошлой консолидации
+                //      (иначе при живой переписке память не пишется ВООБЩЕ —
+                //      консолидация ждала бы 15 минут молчания);
+                //   2) абсолютный порог символов: diary_token_count_trigger × 4.
                 let overflow_limit =
                     cfg.misc.diary_token_count_trigger as usize * 4;
                 let total_chars: usize = tg_history_full
                     .iter()
                     .map(|(_, _, t, _)| t.chars().count())
                     .sum();
-                if !consolidated && total_chars >= overflow_limit {
-                    info!("[tg] overflow: {} симв >= {} — консолидация", total_chars, overflow_limit);
+                let grew = tg_history_full.len().saturating_sub(last_consolidated_history_len);
+                if !consolidated && (grew >= 20 || total_chars >= overflow_limit) {
+                    info!(
+                        "[tg] overflow: +{} сообщений (всего {} симв, порог {}) — консолидация",
+                        grew, total_chars, overflow_limit
+                    );
                     consolidated = true;
                     let chat_turns: Vec<furinya_diary::ChatTurn> =
                         furinya_diary::ChatTurn::from_tg_full(
@@ -1992,6 +2004,8 @@ pub async fn run_telegram_mode(
                         let drop = tg_history_full.len() - KEEP_LAST;
                         tg_history_full.drain(..drop);
                     }
+                    // С этого места история «свежая» — следующий overflow считаем заново.
+                    last_consolidated_history_len = tg_history_full.len();
                     // tg_history — живой хвост: system + последние recent_limit.
                     let rr = cfg.general.tg_recent_limit.max(1);
                     let tl_start = tg_history_full.len().saturating_sub(rr);
