@@ -65,7 +65,10 @@ if ! ssh_pve "pct status $LXC_ID" >/dev/null 2>&1; then
   echo "==> Старт LXC"
   ssh_pve "pct start $LXC_ID"
   echo "==> Ставим базу (обновление apt — заодно проверка сети)"
-  ssh_pve "pct exec $LXC_ID -- bash -c 'apt-get update -qq && apt-get install -y -qq ca-certificates'"
+  ssh_pve "pct exec $LXC_ID -- bash -c 'apt-get update -qq && apt-get install -y -qq ca-certificates tzdata'"
+  # Таймзона: тихие часы считаются по ЛОКАЛЬНОМУ времени (у юзера MSK),
+  # в LXC по умолчанию UTC — иначе окно сна съедет на 3 часа.
+  ssh_pve "pct exec $LXC_ID -- bash -c 'ln -sf /usr/share/zoneinfo/Europe/Moscow /etc/localtime && echo Europe/Moscow > /etc/timezone && date'"
 else
   echo "==> LXC $LXC_ID уже существует"
   ssh_pve "pct start $LXC_ID" 2>/dev/null || true
