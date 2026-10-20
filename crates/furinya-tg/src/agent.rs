@@ -1414,6 +1414,10 @@ pub async fn run_telegram_mode(
     // id уже загруженных сообщений — защита от дублей при пагинации.
     let mut history_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
     let mut history_from_id: i64;
+    // Повторные попытки загрузить историю: TDLib сначала отдаёт локальный
+    // кэш (часто 1 сообщение), а полный список с сервера приходит позже.
+    let mut history_attempts: u32 = 0;
+    let mut history_retry_at: Option<Instant> = None;
     let history_load_limit = cfg.general.tg_history_load_limit.max(50);
 
     // Локальный stdin — единственный путь к тех. командам (consolidate / memory build / save / exit).
@@ -1446,8 +1450,13 @@ pub async fn run_telegram_mode(
     loop {
         if !history_requested {
             history_requested = true;
+            // ВАЖНО: сначала openChat — иначе TDLib не держит сообщения
+            // локально и history-запросы возвращают пустоту (так было на
+            // свежем LXC: сессия переехала, а история не пришла).
+            client.open_chat(cfg.general.papik_chat_id);
+            client.get_chat_history(cfg.general.papik_chat_id, 100, 0, "history_load");
             client.search_chat_messages(cfg.general.papik_chat_id, 0, 0, 100, "history_load");
-            info!("[tg] запрошена история чата (searchChatMessages)");
+            info!("[tg] запрошена история чата (openChat + getChatHistory + searchChatMessages)");
         }
         let v = if idle_to > 0 {
             match update_loop.updates.recv_timeout(Duration::from_millis(200)) {
@@ -1556,6 +1565,11 @@ pub async fn run_telegram_mode(
                                 recent_len,
                                 tg_history_full.len()
                             );
+                            // Мало сообщений — TDLib отдал локальный кэш, а полный
+                            // список с сервера ещё не пришёл. Повторяем позже.
+                            if tg_history_full.len() < 20 && history_attempts < 6 {
+                                history_retry_at = Some(Instant::now() + Duration::from_secs(15));
+                            }
                         }
                         continue;
                     }
@@ -1611,6 +1625,21 @@ pub async fn run_telegram_mode(
                     }
                     let elapsed_user = last_user_activity.elapsed().as_secs();
                     let elapsed_any = last_activity.elapsed().as_secs();
+                    // ── Повтор загрузки истории (TDLib отдаёт кэш, потом сервер) ──
+                    if let Some(t) = history_retry_at {
+                        if Instant::now() >= t && history_attempts < 6 {
+                            history_attempts += 1;
+                            history_retry_at = None;
+                            client.open_chat(papik);
+                            client.get_chat_history(papik, 100, 0, "history_load");
+                            client.search_chat_messages(papik, 0, 0, 100, "history_load");
+                            info!(
+                                "[tg] повтор запроса истории (попытка {}), в кэше пока {} сообщений",
+                                history_attempts,
+                                tg_history_full.len()
+                            );
+                        }
+                    }
                     // Статус "в сети" сбрасываем после 2 мин тишины (не чаще
                     // раза в минуту — setOption не дёргаем каждые 200мс).
                     // СТАРТ: true никогда не было (offline после Ready).

@@ -35,12 +35,26 @@ echo "==> Проверка доступа к $PVE_HOST"
 ssh_pve 'hostname; pveversion | head -1'
 
 # ── 1. Шаблон ОС ────────────────────────────────────────────────────────────
-echo "==> Ищем шаблон Debian 12"
-LXC_TEMPLATE="$(ssh_pve "pvesm list local --content vztmpl | awk '/debian-12/ {print \$1}' | head -1")"
+# Приоритет: debian-13 (glibc 2.41) — нужен для libtdjson.so (требует GLIBC_2.38);
+# fallback debian-12 (glibc 2.36) — только если .so пересобрана под него.
+echo "==> Ищем шаблон ОС"
+LXC_TEMPLATE=""
+for pat in "debian-13" "debian-12"; do
+  T="$(ssh_pve "pvesm list local --content vztmpl | awk '/${pat}/ {print \$1}' | head -1")"
+  if [ -n "$T" ]; then LXC_TEMPLATE="$T"; break; fi
+done
 if [ -z "$LXC_TEMPLATE" ]; then
-  echo "==> Скачиваем шаблон Debian 12"
-  ssh_pve 'pveam update && pveam download debian-12 standard'
-  LXC_TEMPLATE="$(ssh_pve "pvesm list local --content vztmpl | awk '/debian-12/ {print \$1}' | head -1")"
+  echo "==> Скачиваем шаблон ОС"
+  for pat in "debian-13-standard" "debian-12-standard"; do
+    TPL=$(ssh_pve "pveam available 2>/dev/null | awk '/system +${pat}/ {print \$2; exit}'")
+    [ -n "$TPL" ] || continue
+    echo "    качаем $TPL"
+    ssh_pve "pveam download local $TPL" && break
+  done
+  for pat in "debian-13" "debian-12"; do
+    T="$(ssh_pve "pvesm list local --content vztmpl | awk '/${pat}/ {print \$1}' | head -1")"
+    if [ -n "$T" ]; then LXC_TEMPLATE="$T"; break; fi
+  done
 fi
 [ -n "$LXC_TEMPLATE" ] || { echo "Шаблон не найден"; exit 1; }
 echo "    шаблон: $LXC_TEMPLATE"
@@ -103,7 +117,7 @@ cp deploy/secrets/node.json         "$STAGE/payload/node.json" 2>/dev/null || tr
 
 # Адрес sd-api: он на DHCP в vmbr0 — узнаём актуальный и пишем в .env,
 # чтобы sd-сервер не уезжал.
-SD_IP="$(ssh_pve "pct exec $SD_LXC_ID -- hostname -I" 2>/dev/null | awk '{print $1}')"
+SD_IP="$(ssh_pve "pct exec $SD_LXC_ID -- ip -4 addr show eth0 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1 | head -1" | tr -d '\r')"
 echo "    sd-api ($SD_LXC_ID) на $SD_IP"
 if [ -z "$SD_IP" ]; then
   SD_IP="$(ssh_pve "pvesh get /nodes/$(hostname)/lxc/$SD_LXC_ID/interface/0/ip 2>/dev/null" | tr -d '"')"

@@ -19,17 +19,19 @@ apt-get update -qq
 apt-get install -y -qq --no-install-recommends ca-certificates curl gzip jq
 
 if [ ! -x "$BIN" ]; then
-  TAG=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)
-  echo "    свежий релиз: $TAG"
-  VER=${TAG#v}
-  for asset in "mihomo-linux-amd64-${VER}.gz" "mihomo-linux-amd64-compatible-${VER}.gz"; do
-    url="https://github.com/MetaCubeX/mihomo/releases/download/${TAG}/${asset}"
-    if curl -fsSL -o /tmp/mihomo.gz "$url"; then
-      echo "    скачали $asset"
-      break
-    fi
+  echo "==> Качаем Mihomo"
+  REL=$(curl -s https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)
+  TAG=$(echo "$REL" | jq -r .tag_name)
+  # Имена ассетов: mihomo-linux-amd64-v1-<ver>.gz, mihomo-linux-amd64-compatible-<ver>.gz
+  ASSET=""
+  for pat in '^mihomo-linux-amd64-v1-.*\.gz$' '^mihomo-linux-amd64-compatible-.*\.gz$' '^mihomo-linux-amd64-.*\.gz$'; do
+    A=$(echo "$REL" | jq -r '.assets[].name' | grep -E "$pat" | head -1)
+    if [ -n "$A" ]; then ASSET="$A"; break; fi
   done
-  [ -s /tmp/mihomo.gz ] || { echo "не скачался бинарь"; exit 1; }
+  [ -n "$ASSET" ] || { echo "не нашли linux-amd64 ассет в $TAG"; exit 1; }
+  echo "    релиз $TAG, ассет $ASSET"
+  url="https://github.com/MetaCubeX/mihomo/releases/download/${TAG}/${ASSET}"
+  curl -fsSL -o /tmp/mihomo.gz "$url" || { echo "не скачался $url"; exit 1; }
   gunzip -c /tmp/mihomo.gz > "$BIN"
   chmod +x "$BIN"
 fi
