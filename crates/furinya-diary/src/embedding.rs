@@ -97,4 +97,41 @@ impl EmbeddingClient {
             .map(|d| d.embedding)
             .ok_or_else(|| anyhow::anyhow!("пустой ответ эмбеддинга"))
     }
+
+    /// Эмбеддинги для пачки текстов одним запросом OpenAI-совместимый:
+    /// `input: [ ... ]`). Mistral возвращает data[] в порядке входных строк.
+    pub async fn embed_batch(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/embeddings", self.base_url);
+        let mut req = self.client.post(&url).json(&serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        }));
+        if !self.bearer_key.is_empty() {
+            req = req.bearer_auth(&self.bearer_key);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("запрос пачки эмбеддингов к {}", url))?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "эмбеддинг API вернул {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        let parsed: EmbeddingResponse = resp.json().await.context("парсинг пачки эмбеддингов")?;
+        let out: Vec<Vec<f32>> = parsed.data.into_iter().map(|d| d.embedding).collect();
+        if out.len() != texts.len() {
+            anyhow::bail!(
+                "пачка эмбеддингов: вернулось {} векторов из {} текстов",
+                out.len(),
+                texts.len()
+            );
+        }
+        Ok(out)
+    }
 }

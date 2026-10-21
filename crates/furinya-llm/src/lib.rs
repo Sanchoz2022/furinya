@@ -853,9 +853,17 @@ impl LlmClient {
         }
     }
 
+    /// Клон клиента с холодной температурой — для служебных вызовов
+    /// (консолидация памяти, извлечение фактов, vision-описания), где
+    /// важна точность, а чат при этом остаётся живым (0.7-0.8).
+    pub fn with_temperature(&self, temperature: f32) -> Self {
+        let mut c = self.clone();
+        c.sampling.temperature = temperature;
+        c
+    }
+
     /// Строит клиент из конфига ядра.
-    pub fn from_config(cfg: &Config) -> Result<Self, LlmError> {
-        let http = reqwest::Client::builder()
+    pub fn from_config(cfg: &Config) -> Result<Self, LlmError> {        let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(900))
             .build()?;
         let sampling = SamplingParams {

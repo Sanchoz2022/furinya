@@ -145,6 +145,16 @@ pub struct MiscConfig {
     /// отдельное сообщение в Telegram). Лишнее отбрасывается.
     #[serde(default = "default_max_parts")]
     pub max_message_parts: usize,
+    /// Анти-повтор (порт kuni, send_telegram_message.cpp): эмбеддинг-проверка
+    /// черновика ответа против её недавних реплик. Максимум похожести —
+    /// anti_repeat_trigger_max, средняя — anti_repeat_trigger_avg. 1.0 = выкл.
+    #[serde(default = "default_anti_repeat_max")]
+    pub anti_repeat_trigger_max: f32,
+    #[serde(default = "default_anti_repeat_avg")]
+    pub anti_repeat_trigger_avg: f32,
+    /// Сколько последних своих реплик держать в кэше эмбеддингов анти-повтора.
+    #[serde(default = "default_anti_repeat_history")]
+    pub anti_repeat_max_history: usize,
     #[serde(default = "default_temp")]
     pub llm_temperature: f32,
     #[serde(default = "default_none_str")]
@@ -225,6 +235,18 @@ fn default_ctx_limit() -> u32 {
 }
 fn default_max_parts() -> usize {
     6
+}
+
+fn default_anti_repeat_max() -> f32 {
+    0.95
+}
+
+fn default_anti_repeat_avg() -> f32 {
+    0.85
+}
+
+fn default_anti_repeat_history() -> usize {
+    32
 }
 fn default_temp() -> f32 {
     0.2

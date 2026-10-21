@@ -11,6 +11,7 @@ use furinya_core::prompts::Prompts;
 use furinya_diary::{
     Diary, Entry, active_context, consolidate_memory, read_active,
 };
+use std::collections::HashMap;
 use furinya_llm::{
     LlmClient, Message, ToolCall, build_tools, extract_thinking, extract_thinking_from_content,
 };
@@ -267,8 +268,11 @@ async fn extract_facts_to_diary(
     diary_entries: &mut Vec<furinya_diary::Entry>,
     cfg: &Config,
 ) {
+    // Извлечение фактов — служебное: холодная температура (точность важнее,
+    // живой 0.8 тут не нужен).
+    let cool_llm = llm.with_temperature(0.2);
     match furinya_diary::build_profile_memory(
-        llm,
+        &cool_llm,
         diary,
         prompts,
         &cfg.misc.diary_dir,
@@ -284,6 +288,111 @@ async fn extract_facts_to_diary(
         }
         Err(e) => error!("[tg] извлечение фактов ошибка: {}", e),
     }
+}
+
+/// Состояние анти-повтора агента: кэш эмбеддингов своих реплик (текст → вектор)
+/// и «индульгенция» kuni (+0.07 за каждый подряд срабатывающий ход).
+struct AntiRepeatState {
+    emb_cache: HashMap<String, Vec<f32>>,
+    head_start: f32,
+}
+
+impl AntiRepeatState {
+    fn new() -> Self {
+        Self {
+            emb_cache: HashMap::new(),
+            head_start: 0.0,
+        }
+    }
+}
+
+/// Эмбеддинг-защита от самоповторов — порт kuni (send_telegram_message.cpp,
+/// «LLM is repeating itself»). Проверяет черновик ответа против недавних
+/// реплик бота: если максимальная похожесть выше anti_repeat_trigger_max
+/// (0.95) или средняя выше anti_repeat_trigger_avg (0.85) — отправка
+/// отменяется, модель передумывает (переформулирует или молчит).
+///
+/// kuni-комментарий: после введения этой проверки качество диалогов
+/// выросло заметно — модель перестаёт копипастить саму себя и либо
+/// переключается на другую тему, либо честно молчит.
+///
+/// Ошибка эмбеддинга НЕ блокирует отправку (мягкая деградация).
+async fn anti_repeat_check(
+    candidate: &str,
+    own_recent: &[String],
+    diary: &Diary,
+    cfg: &Config,
+    st: &mut AntiRepeatState,
+) -> Result<(), String> {
+    let cand = candidate.trim();
+    if cand.is_empty()
+        || own_recent.is_empty()
+        || cfg.misc.anti_repeat_trigger_max >= 1.0
+        || cfg.misc.anti_repeat_trigger_avg >= 1.0
+    {
+        return Ok(());
+    }
+    // Чего не хватает в кэше — берём одной пачкой (Mistral: 1 RPS,
+    // один batch-запрос вместо десятка одиночных).
+    let mut need = vec![cand.to_string()];
+    for own in own_recent {
+        if !st.emb_cache.contains_key(own) && !need.contains(own) {
+            need.push(own.clone());
+        }
+    }
+    if let Ok(vecs) = diary.embedding().embed_batch(&need).await {
+        for (t, v) in need.into_iter().zip(vecs) {
+            st.emb_cache.insert(t, v);
+        }
+    } else {
+        // Кэш не помог: пробуем хотя бы черновик по одному.
+        match diary.embedding().embed(cand).await {
+            Ok(v) => {
+                st.emb_cache.insert(cand.to_string(), v);
+            }
+            Err(e) => {
+                tracing::warn!("[tg] анти-повтор: эмбеддинги недоступны ({e}) — пропускаю");
+                return Ok(());
+            }
+        }
+    }
+    let Some(target) = st.emb_cache.get(cand).cloned() else {
+        return Ok(());
+    };
+    let mut max_sim = 0.0f32;
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for own in own_recent {
+        let Some(emb) = st.emb_cache.get(own) else {
+            continue;
+        };
+        let sim = furinya_diary::cosine_similarity(&target, emb);
+        sum += sim;
+        count += 1;
+        max_sim = max_sim.max(sim);
+    }
+    if count == 0 {
+        return Ok(());
+    }
+    let avg = sum / count as f32;
+    debug!(
+        "[tg] анти-повтор: max={max_sim:.2} avg={avg:.2} (порог {}/{} + {:.2})",
+        cfg.misc.anti_repeat_trigger_max, cfg.misc.anti_repeat_trigger_avg, st.head_start
+    );
+    if max_sim > cfg.misc.anti_repeat_trigger_max + st.head_start {
+        st.head_start += 0.07; // индульгенция kuni: повторяемости прощают больше
+        return Err(format!("maxSimilarity={max_sim:.2}"));
+    }
+    if avg > cfg.misc.anti_repeat_trigger_avg + st.head_start {
+        st.head_start += 0.07;
+        return Err(format!("avgSimilarity={avg:.2}"));
+    }
+    st.head_start = 0.0; // успех — индульгенция сбрасывается
+    // Ротация кэша (как в kuni: разросся — чистим весь).
+    if st.emb_cache.len() >= cfg.misc.anti_repeat_max_history.max(2) {
+        st.emb_cache.clear();
+    }
+    Ok(())
 }
 
 /// Исполняет TG-инструмент (send_telegram_message / react_with_emoji / ask / ...).
@@ -302,6 +411,9 @@ async fn execute_tg_tool(
     diary: &Diary,
     diary_entries: &mut Vec<Entry>,
     cfg: &Config,
+    own_recent: &[String],
+    anti_repeat_prompt: &str,
+    rep: &mut AntiRepeatState,
 ) -> (String, Vec<String>) {
     match name {
         "send_telegram_message" => {
@@ -355,6 +467,21 @@ async fn execute_tg_tool(
                 }
             }
             let parts: Vec<_> = merged.into_iter().take(6).collect();
+            // Анти-повтор (порт kuni): черновик слишком похож на её недавние
+            // реплики — не отправляем ВООБЩЕ (иначе повторится спарки «Мурр…
+            // я тут» из хода в ход). Модель увидит anti_repeat-подсказку и
+            // переформулирует или промолчит.
+            for part in &parts {
+                if let Err(sim) = anti_repeat_check(part, own_recent, diary, cfg, rep).await {
+                    warn!("[tg] анти-повтор заблокировал отправку: {sim} — {:?}", part);
+                    return (
+                        format!(
+                            "ПОВТОР ({sim}). Тот же смысл ты уже отправляла. {anti_repeat_prompt}"
+                        ),
+                        Vec::new(),
+                    );
+                }
+            }
             let mut rng = rand::thread_rng();
             for part in &parts {
                 // Реалистичный ввод текста: typing-action + пауза по длине
@@ -640,6 +767,17 @@ async fn execute_tg_tool(
                     Vec::new(),
                 );
             }
+            // Анти-повтор: то же самое для голосовых (ночные обнимашки шли
+            // одной и той же фразой).
+            if let Err(sim) = anti_repeat_check(&voice_text, own_recent, diary, cfg, rep).await {
+                warn!("[tg] анти-повтор заблокировал голосовое: {sim}");
+                return (
+                    format!(
+                        "ПОВТОР ({sim}). То же самое ты уже отправляла голосом. {anti_repeat_prompt}"
+                    ),
+                    Vec::new(),
+                );
+            }
             if voice_text.len() > 900 {
                 // ~1.5 лимита голосового: берём начало.
                 voice_text = voice_text.chars().take(900).collect();
@@ -706,7 +844,7 @@ pub async fn handle_new_message(
     llm: &LlmClient,
     client: &TdClient,
     diary: &Diary,
-    _prompts: &Prompts,
+    prompts: &Prompts,
     diary_entries: &mut Vec<Entry>,
     tg_history: &mut Vec<Message>,
     tg_history_full: &mut Vec<(i64, bool, String, i64)>,
@@ -775,8 +913,10 @@ pub async fn handle_new_message(
                                 &vcfg.llm_image_to_text.bearer_key,
                                 &vcfg.llm_image_to_text.model,
                                 furinya_llm::SamplingParams {
-                                    temperature: cfg.misc.llm_temperature,
-                                    top_p: cfg.misc.llm_top_p.parse().ok(),
+                                    // Vision-описания — служебные, холодные
+                                    // (факт по картинке, а не импровизация).
+                                    temperature: 0.3,
+                                    top_p: None,
                                     top_k: None,
                                     min_p: cfg.misc.llm_min_p.parse().ok(),
                                     presence_penalty: cfg.misc.presence_penalty.parse().ok(),
@@ -918,6 +1058,14 @@ pub async fn handle_new_message(
     // без предшествующего assistant.tool_calls роняет Mistral ошибкой
     // 400 "Unexpected role 'tool' after role 'system'" (код 3230).
     let mut turn_ctx: Vec<Message> = Vec::new();
+    // Анти-повтор (порт kuni): кэш эмбеддингов живёт на один вызов хода —
+    // черновики отправок сравниваются с её недавними репликами из истории.
+    let mut rep_state = AntiRepeatState::new();
+    let anti_repeat_prompt = prompts
+        .extra
+        .get("anti_repeat")
+        .cloned()
+        .unwrap_or_default();
     for turn in 1..=max_turns {
         let mut messages = vec![Message::system(tg_system_prompt.to_string())];
         if turn == 1 {
@@ -1007,15 +1155,18 @@ pub async fn handle_new_message(
                 injected_chars
             );
         }
-        // История чата: последние 8 сообщений в ХРОНОЛОГИЧЕСКОМ порядке
+        // История чата: последние N сообщений в ХРОНОЛОГИЧЕСКОМ порядке
         // (раньше .rev() инвертировал переписку — модель читала её задом
         // наперёд, отсюда «странные реакции»). tg_history содержит только
         // system/user/assistant — порядок всегда валиден для Mistral.
+        // N из конфига (tg_recent_limit), а не хардкод: модель должна видеть
+        // связь последних реплик хотя бы на разговор вперёд.
+        let recent = cfg.general.tg_recent_limit.max(1);
         let hist_tail: Vec<Message> = tg_history
             .iter()
             .skip(1)
             .rev()
-            .take(8)
+            .take(recent)
             .cloned()
             .collect::<Vec<_>>()
             .into_iter()
@@ -1157,6 +1308,19 @@ pub async fn handle_new_message(
         let mut real_tool_done = false;
         for (call_idx, tc) in tool_calls.iter().enumerate() {
             let call_id = turn_calls[call_idx].id.clone();
+            // Свои недавние реплики для анти-повтора: из полной живой истории
+            // (is_me=true), последние 16 — этого окна хватало kuni. Считаем
+            // ПЕРЕД каждым вызовом: часть 2 пачки сравнится и с частью 1,
+            // которую только что отправили.
+            let mut own_texts: Vec<String> = tg_history_full
+                .iter()
+                .filter(|e| e.1)
+                .map(|e| e.2.clone())
+                .collect();
+            if own_texts.len() > 16 {
+                let cut = own_texts.len() - 16;
+                own_texts.drain(..cut);
+            }
             if tc.function.name == "stay_quiet" {
                 if !is_idle {
                     // На живое сообщение молчать нельзя — возвращаем модели:
@@ -1226,6 +1390,9 @@ pub async fn handle_new_message(
                 diary,
                 diary_entries,
                 cfg,
+                &own_texts,
+                &anti_repeat_prompt,
+                &mut rep_state,
             )
             .await;
             if tc.function.name == "send_telegram_message" {
@@ -1254,6 +1421,21 @@ pub async fn handle_new_message(
                         } else {
                             warn!("[tg] фолбэк-текст НЕ отправлен: голосовой ввод требует голос");
                         }
+                        break;
+                    }
+                    continue;
+                }
+                if result.starts_with("ПОВТОР") {
+                    // Анти-повтор сработал: в чат ничего не ушло. Модель
+                    // переформулирует (kuni: лучше молчать, чем повторяться).
+                    warn!("[tg] send_telegram_message: {}", result);
+                    turn_ctx.push(Message::tool_result(
+                        Some(call_id),
+                        Some("send_telegram_message".to_string()),
+                        result.clone(),
+                    ));
+                    if turn == max_turns {
+                        debug!("[tg] анти-повтор в конце хода — молчим вместо canned-реплики");
                         break;
                     }
                     continue;
@@ -1684,8 +1866,9 @@ pub async fn run_telegram_mode(
                             || cmd.eq_ignore_ascii_case("save")
                         {
                             info!("[tg] команда из stdin: consolidate");
+                            let cool_llm = llm.with_temperature(0.2);
                             match consolidate_memory(
-                                llm,
+                                &cool_llm,
                                 diary,
                                 prompts,
                                 diary_entries,
@@ -1702,8 +1885,9 @@ pub async fn run_telegram_mode(
                             }
                         } else if cmd.eq_ignore_ascii_case("memory build") {
                             info!("[tg] команда из stdin: memory build");
+                            let cool_llm = llm.with_temperature(0.2);
                             match furinya_diary::build_profile_memory(
-                                llm,
+                                &cool_llm,
                                 diary,
                                 prompts,
                                 &cfg.misc.diary_dir,
@@ -1784,6 +1968,9 @@ pub async fn run_telegram_mode(
                         // (stay_quiet). Хардкода нет.
                         if !consolidated {
                             consolidated = true;
+                            // Память — служебное: холодный клиент (0.2), чтобы
+                            // живой чат (0.8) не привнёс импровизацию в факты.
+                            let cool_llm = llm.with_temperature(0.2);
                             let chat_turns: Vec<furinya_diary::ChatTurn> =
                                 furinya_diary::ChatTurn::from_tg_full(
                                     &tg_history_full,
@@ -1791,7 +1978,7 @@ pub async fn run_telegram_mode(
                                     &cfg.general.papik_name,
                                 );
                             match consolidate_memory(
-                                llm,
+                                &cool_llm,
                                 diary,
                                 prompts,
                                 diary_entries,
@@ -2020,6 +2207,8 @@ pub async fn run_telegram_mode(
                         grew, total_chars, overflow_limit
                     );
                     consolidated = true;
+                    // Память — служебное: холодный клиент (0.2).
+                    let cool_llm = llm.with_temperature(0.2);
                     let chat_turns: Vec<furinya_diary::ChatTurn> =
                         furinya_diary::ChatTurn::from_tg_full(
                             &tg_history_full,
@@ -2027,7 +2216,7 @@ pub async fn run_telegram_mode(
                             &cfg.general.papik_name,
                         );
                     match consolidate_memory(
-                        llm,
+                        &cool_llm,
                         diary,
                         prompts,
                         diary_entries,
