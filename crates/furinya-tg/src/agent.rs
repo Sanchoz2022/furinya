@@ -1271,6 +1271,9 @@ pub async fn handle_new_message(
     // Анти-повтор (порт kuni): кэш эмбеддингов живёт на один вызов хода —
     // черновики отправок сравниваются с её недавними репликами из истории.
     let mut rep_state = AntiRepeatState::new();
+    // Ход, в котором анти-повтор вернул ПОВТОР-нудж: canned-фолбэки после него
+    // запрещены (тишина/переписывание лучше «я чуть зависла…» — это тоже спам).
+    let mut repeat_nudged = false;
     let anti_repeat_prompt = prompts
         .extra
         .get("anti_repeat")
@@ -1639,15 +1642,12 @@ pub async fn handle_new_message(
                     // Анти-повтор сработал: в чат ничего не ушло. Модель
                     // переформулирует (kuni: лучше молчать, чем повторяться).
                     warn!("[tg] send_telegram_message: {}", result);
+                    repeat_nudged = true;
                     turn_ctx.push(Message::tool_result(
                         Some(call_id),
                         Some("send_telegram_message".to_string()),
                         result.clone(),
                     ));
-                    if turn == max_turns {
-                        debug!("[tg] анти-повтор в конце хода — молчим вместо canned-реплики");
-                        break;
-                    }
                     continue;
                 }
                 info!(
@@ -1694,6 +1694,18 @@ pub async fn handle_new_message(
                 ask_exhausted = true;
             }
         }
+        if repeat_nudged {
+            // Нудж анти-повтора уже в turn_ctx. kuni-философия: лучше молчать
+            // или переписать, чем слать canned-реплику («я чуть зависла…») —
+            // это сам по себе повтор и спам. Раньше этот переход попадал в
+            // canned-фолбэк в ту же миллисекунду — модель никогда не
+            // переформулировала. Отсюда новые ходы до max_turns без fallback.
+            if turn < max_turns {
+                continue;
+            }
+            debug!("[tg] анти-повтор в конце хода — молчим вместо canned-реплики");
+            break;
+        }
         if chose_quiet {
             // Ход закрылся тишиной: в чат ничего не ушло. Дальше — тишина.
             debug!("[tg] ход завершён промолчанием");
@@ -1721,6 +1733,11 @@ pub async fn handle_new_message(
                 if final_sent_via_tool {
                     // Ответ уже отправлен — canned-реплика не нужна.
                     debug!("[tg] лимит tool-loop, но ответ уже отправлен — молча закрываем");
+                    break;
+                }
+                if repeat_nudged {
+                    // Нудж уже был: canned-реплика = ещё один спам-повтор.
+                    debug!("[tg] лимит tool-loop после нуджа анти-повтора — молчим");
                     break;
                 }
                 warn!(
@@ -1762,6 +1779,10 @@ pub async fn handle_new_message(
         if is_idle {
             // Idle: canned-реплика тут была бы «спамом по часам» — молчим.
             warn!("[tg] idle: ни один tool не завершил ход — промолчали");
+            break;
+        }
+        if repeat_nudged {
+            debug!("[tg] ни один tool после нуджа анти-повтора — молчим");
             break;
         }
         warn!("[tg] ни один tool не завершил ответ — fallback");
