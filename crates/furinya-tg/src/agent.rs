@@ -25,6 +25,112 @@ use tracing::{debug, error, info, warn};
 
 use crate::{TdClient, UpdateLoop, auth, default_lib_path};
 
+// ── Новости из Telegram-каналов (актуальность для разговоров) ─────────────
+//
+// Механика: аккаунт бота подписывается на новостные каналы (Россия + НН)
+// и читает их через TDLib. Сообщения каналов — НЕ «разговор»: они кладутся
+// в кэш, из которого берутся (а) заголовки в idle-стимул — чтобы ей было
+// О ЧЁМ поговорить, (б) инструмент fresh_news для живого чата.
+
+/// Одна новость из канала.
+#[derive(Debug, Clone)]
+struct NewsItem {
+    chat_id: i64,
+    chat_title: String,
+    message_id: i64,
+    /// Unix-время сообщения (поле date).
+    ts: i64,
+    text: String,
+}
+
+/// Кэш прочитанных новостей: поллер пишет, fresh_news и idle-стимул читают.
+static NEWS: std::sync::LazyLock<std::sync::Mutex<Vec<NewsItem>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Resolved новостные каналы: chat_id → заголовок канала.
+static NEWS_CHANNELS: std::sync::LazyLock<std::sync::Mutex<HashMap<i64, String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Максимальная ёмкость кэша (старьё вытирается).
+const NEWS_CACHE_CAP: usize = 400;
+
+fn push_news(item: NewsItem) {
+    if item.text.chars().count() < 15 {
+        // «Фото», пустые подписи и прочий мусор не нужны.
+        return;
+    }
+    let mut v = NEWS.lock().unwrap();
+    if v.iter()
+        .any(|n| n.chat_id == item.chat_id && n.message_id == item.message_id)
+    {
+        return;
+    }
+    v.push(item);
+    if v.len() > NEWS_CACHE_CAP {
+        let excess = v.len() - NEWS_CACHE_CAP;
+        v.drain(0..excess);
+    }
+}
+
+/// Текст из TDLib-сообщения: messageText или caption у медиа.
+fn news_message_text(msg: &Value) -> Option<String> {
+    let content = &msg["content"];
+    let t = content["text"]["text"]
+        .as_str()
+        .or_else(|| content["caption"]["text"].as_str())?
+        .trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Последние `n` новостей, отсортированные по свежести (новые раньше).
+fn news_headlines(n: usize) -> Vec<NewsItem> {
+    let mut window: Vec<NewsItem> = NEWS.lock().unwrap().iter().rev().take(200).cloned().collect();
+    window.sort_by_key(|i| std::cmp::Reverse(i.ts));
+    window.into_iter().take(n).collect()
+}
+
+/// Строка «— [канал · N мин назад]: текст» для отображения новости.
+fn format_news_line(item: &NewsItem, max_chars: usize) -> String {
+    let age_min = if item.ts > 0 {
+        let elapsed = (Utc::now().timestamp() - item.ts) / 60;
+        if elapsed <= 0 {
+            "только что".to_string()
+        } else if elapsed < 60 {
+            format!("{} мин назад", elapsed)
+        } else {
+            format!("{} ч назад", elapsed / 60)
+        }
+    } else {
+        "недавно".to_string()
+    };
+    let mut t: String = item.text.chars().take(max_chars).collect();
+    if item.text.chars().count() > max_chars {
+        t.push('…');
+    }
+    let t = t.replace('\n', " ");
+    format!("— [{} · {}]: {}", item.chat_title, age_min, t)
+}
+
+/// Блок заголовков для инъекции в контекст (idle-стимул). Пусто, когда новостей нет.
+fn news_hint(max_items: usize, max_chars_each: usize) -> String {
+    let items = news_headlines(max_items);
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n[свежее из новостных каналов — если захочешь первой написать о чем-то актуальном, можешь коротко упомянуть и добавить СВОЁ мнение; не пересказывай длинно]\n",
+    );
+    for it in &items {
+        s.push_str(&format_news_line(it, max_chars_each));
+        s.push('\n');
+    }
+    s
+}
+
 /// Дробит ответ модели на части для отправки несколькими сообщениями.
 fn split_message(text: &str, max_parts: usize) -> Vec<String> {
     let max_parts = max_parts.clamp(1, 10);
@@ -570,7 +676,7 @@ async fn execute_tg_tool(
             }
             let res: String = match diary.embedding().embed(&query_text).await {
                 Ok(vec) => {
-                    let hits = diary.query_top_n(diary_entries, &vec, 4);
+                    let hits = diary.query_top_n(diary_entries, &vec, 6);
                     if hits.is_empty() {
                         "Дневник: релевантных воспоминаний не найдено.".to_string()
                     } else {
@@ -580,7 +686,7 @@ async fn execute_tg_tool(
                                 .entry
                                 .body
                                 .chars()
-                                .take(500)
+                                .take(1200)
                                 .collect();
                             let preview = preview.trim();
                             out.push_str(&format!(
@@ -606,6 +712,110 @@ async fn execute_tg_tool(
                 "ОК: ты промолчала. В чат ничего не отправлено, ход завершён.".to_string(),
                 Vec::new(),
             )
+        }
+        "internet_search" => {
+            let v: Value = match serde_json::from_str(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        format!("ОШИБКА: невалидный JSON в internet_search: {e}"),
+                        Vec::new(),
+                    )
+                }
+            };
+            let query = v["query"].as_str().unwrap_or("").trim();
+            if query.is_empty() {
+                return (
+                    "ОШИБКА: пустой запрос internet_search.".to_string(),
+                    Vec::new(),
+                );
+            }
+            // Два источника параллельно: веб (DDG) и новости по теме (Google News).
+            // DDG душит челленджами resident IP — тогда остаются новости.
+            let (web_res, news_res) = tokio::join!(
+                furinya_web::search(query, 4),
+                furinya_web::news_search(query, 4),
+            );
+            let mut out = format!("Результаты поиска «{query}»:\n");
+            let mut found = false;
+            if let Ok(list) = web_res.as_ref() {
+                for r in list.iter() {
+                    found = true;
+                    let mut sn: String = r.snippet.chars().take(180).collect();
+                    if r.snippet.chars().count() > 180 {
+                        sn.push('…');
+                    }
+                    out.push_str(&format!("· {} — {}\n   {}\n", r.title, r.url, sn));
+                }
+            }
+            if let Ok(list) = news_res.as_ref() {
+                for n in list.iter() {
+                    found = true;
+                    let date = if n.date_str.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", n.date_str)
+                    };
+                    out.push_str(&format!("📰 {} — {}{}\n", n.title, n.source, date));
+                }
+            }
+            if found {
+                (out, Vec::new())
+            } else {
+                let err = web_res
+                    .err()
+                    .map(|e| e.to_string())
+                    .or_else(|| news_res.err().map(|e| e.to_string()))
+                    .unwrap_or_else(|| "пустые результаты".to_string());
+                (
+                    format!(
+                        "ОШИБКА поиска: {err}. Можешь честно сказать собеседнику, что у тебя интернет глючит, — желательно с грустью в голосе."
+                    ),
+                    Vec::new(),
+                )
+            }
+        }
+        "web_open" => {
+            let v: Value = match serde_json::from_str(args) {
+                Ok(v) => v,
+                Err(e) => {
+                    return (
+                        format!("ОШИБКА: невалидный JSON в web_open: {e}"),
+                        Vec::new(),
+                    )
+                }
+            };
+            let url = v["url"].as_str().unwrap_or("").trim();
+            if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+                return (
+                    "ОШИБКА: web_open ждёт ссылку, начинающуюся с http:// или https://."
+                        .to_string(),
+                    Vec::new(),
+                );
+            }
+            match furinya_web::open_page(url, 2000).await {
+                Ok(text) => (text, Vec::new()),
+                Err(e) => (
+                    format!("ОШИБКА открытия {url}: {e}"),
+                    Vec::new(),
+                ),
+            }
+        }
+        "fresh_news" => {
+            let headlines = news_headlines(12);
+            if headlines.is_empty() {
+                return (
+                    "Новостной кэш пока пуст (каналы ещё не опросились) — попробуй потом или используй internet_search."
+                        .to_string(),
+                    Vec::new(),
+                );
+            }
+            let mut out = String::from("Свежее из новостных каналов:\n");
+            for it in &headlines {
+                out.push_str(&format_news_line(it, 160));
+                out.push('\n');
+            }
+            (out, Vec::new())
         }
         "diary_page" => (
             "Инструмент diary_page недоступен в чате. Память консолидируется автоматически в режиме сна."
@@ -1189,7 +1399,7 @@ pub async fn handle_new_message(
         std::io::stdout().flush().ok();
         let mut full = String::new();
         let mut reasoning_acc = String::new();
-        let tools = build_tools();
+        let tools = build_tools(cfg);
         let tool_calls = match llm
             .chat_stream(
                 messages.clone(),
@@ -1571,6 +1781,121 @@ pub async fn handle_new_message(
 
 /// Режим Telegram: авторизация, цикл update-ов, idle/sleep автономность.
 #[allow(clippy::collapsible_if)]
+/// Резолвит новостные каналы (username → chat_id), опционально подписывается
+/// (joinChat) и открывает их. Успешные каналы попадают в NEWS_CHANNELS.
+async fn setup_news_channels(client: &TdClient, cfg: &Config) {
+    for (idx, raw) in cfg.misc.news_channels.iter().enumerate() {
+        let username = raw.trim().trim_start_matches('@');
+        if username.is_empty() {
+            continue;
+        }
+        let extra = format!("news_setup_{idx}");
+        match client
+            .query_td(
+                serde_json::json!({"@type": "searchPublicChat", "username": username}),
+                &extra,
+                Duration::from_secs(15),
+            )
+            .await
+        {
+            Ok(v) if v["@type"].as_str() == Some("chat") => {
+                let id = v["id"].as_i64().unwrap_or(0);
+                if id == 0 {
+                    warn!("[news] @{username}: TDLib вернул chat без id, пропущен");
+                    continue;
+                }
+                let title = v["title"].as_str().unwrap_or(username).to_string();
+                if cfg.misc.news_auto_join {
+                    let jextra = format!("news_join_{idx}");
+                    match client
+                        .query_td(
+                            serde_json::json!({"@type": "joinChat", "chat_id": id}),
+                            &jextra,
+                            Duration::from_secs(15),
+                        )
+                        .await
+                    {
+                        Ok(jv) => {
+                            if jv["@type"].as_str() == Some("error") {
+                                // «уже подписан» и прочие мягкие случаи не страшны
+                                warn!(
+                                    "[news] joinChat @{username}: {} (продолжаю)",
+                                    jv["message"].as_str().unwrap_or("?")
+                                );
+                            } else {
+                                info!("[news] подписалась на @{username}");
+                            }
+                        }
+                        Err(e) => warn!("[news] joinChat @{username}: {e}"),
+                    }
+                }
+                client.open_chat(id);
+                NEWS_CHANNELS.lock().unwrap().insert(id, title);
+                info!("[news] канал @{username} → chat_id={id}");
+            }
+            Ok(v) => {
+                warn!(
+                    "[news] @{username}: {} — канал пропущен",
+                    v["message"].as_str().unwrap_or(v["@type"].as_str().unwrap_or("?"))
+                );
+            }
+            Err(e) => {
+                warn!("[news] @{username}: не резолвится ({e}) — канал пропущен");
+            }
+        }
+    }
+}
+
+/// Один проход опроса: getChatHistory по каждому каналу, тексты → в кэш.
+async fn poll_news_once(client: &TdClient, limit_per_channel: i64) {
+    let channels: Vec<(i64, String)> = {
+        let map = NEWS_CHANNELS.lock().unwrap();
+        map.iter().map(|(k, v)| (*k, v.clone())).collect()
+    };
+    for (idx, (chat_id, title)) in channels.iter().enumerate() {
+        // openChat идемпотентен и нужен для getChatHistory.
+        client.open_chat(*chat_id);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let extra = format!("news_poll_{idx}");
+        match client
+            .query_td(
+                serde_json::json!({
+                    "@type": "getChatHistory",
+                    "chat_id": chat_id,
+                    "limit": limit_per_channel,
+                    "from_message_id": 0,
+                }),
+                &extra,
+                Duration::from_secs(25),
+            )
+            .await
+        {
+            Ok(v) => {
+                let Some(list) = v["messages"].as_array() else {
+                    continue;
+                };
+                let mut added = 0;
+                for msg in list {
+                    if let Some(text) = news_message_text(msg) {
+                        push_news(NewsItem {
+                            chat_id: *chat_id,
+                            chat_title: title.clone(),
+                            message_id: msg["id"].as_i64().unwrap_or(0),
+                            ts: msg["date"].as_i64().unwrap_or(0),
+                            text,
+                        });
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    debug!("[news] {title}: +{added} в кэш");
+                }
+            }
+            Err(e) => warn!("[news] getChatHistory {title}: {e}"),
+        }
+    }
+}
+
 pub async fn run_telegram_mode(
     cfg: &Config,
     llm: &LlmClient,
@@ -1654,6 +1979,31 @@ pub async fn run_telegram_mode(
     }
     let mut chats_requested = false;
     let mut history_requested = false;
+
+    // Новостные каналы: setup (резолв+join) один раз здесь, затем периодический
+    // poll в фоне. Кэш читают fresh_news и idle-стимул; живые посты каналов
+    // прилетают и через диспетчер updateNewMessage (гейт ниже пишет их в кэш).
+    if !cfg.misc.news_channels.is_empty() && cfg.misc.news_poll_secs > 0 {
+        setup_news_channels(&client, cfg).await;
+        let poll_secs = cfg.misc.news_poll_secs;
+        let news_client = client.clone();
+        tokio::spawn(async move {
+            // После логина TDLib может ещё дожёвывать готовность — даём время.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            poll_news_once(&news_client, 20).await;
+            info!("[news] первичный опрос каналов выполнен");
+            let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs.max(60)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                poll_news_once(&news_client, 15).await;
+            }
+        });
+        info!(
+            "[news] новостные каналы включены: {:?}, опрос каждые {} c",
+            cfg.misc.news_channels, poll_secs
+        );
+    }
 
     info!("[tg] слушаю update-ы (Ctrl-C для выхода)...");
     let tg_system_prompt = prompts.build_system_prompt();
@@ -2072,7 +2422,7 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[idle] [внутреннее] Сейчас {}:{} по времени Саши. Тишина: он не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если он сейчас спит или ему не до тебя — не пиши вовсе (stay_quiet). Если нечего сказать или не хочется — тоже промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.{}", local_now.hour(), local_now.minute(), elapsed_any / 60, own_hint) } }
+                                "content": { "text": { "text": format!("[idle] [внутреннее] Сейчас {}:{} по времени Саши. Тишина: он не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если он сейчас спит или ему не до тебя — не пиши вовсе (stay_quiet). Если нечего сказать или не хочется — тоже промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.{}{}", local_now.hour(), local_now.minute(), elapsed_any / 60, own_hint, news_hint(3, 110)) } }
                             }
                         });
                         let before = tg_history_full.len();
@@ -2125,8 +2475,15 @@ pub async fn run_telegram_mode(
             // Сброс idle-таймера — только на ЧУЖИЕ сообщения: собственные
             // исходящие (updateNewMessage is_outgoing) активностью юзера
             // не являются и не должны мешать консолидации/инициативе.
+            // Гейт: посты новостных каналов и чужих чатов НЕ активность Саши —
+            // иначе бот просыпается от ленты новостей.
+            let msg_chat_id = v["message"]["chat_id"].as_i64().unwrap_or(0);
+            let is_news_gated = msg_chat_id != 0
+                && NEWS_CHANNELS.lock().unwrap().contains_key(&msg_chat_id);
+            let is_papik_chat =
+                msg_chat_id == cfg.general.papik_chat_id || msg_chat_id == 0;
             let out_sender = v["message"]["sender_id"]["user_id"].as_i64().unwrap_or(0);
-            if out_sender != my_id {
+            if !is_news_gated && is_papik_chat && out_sender != my_id {
                 last_user_activity = Instant::now();
                 last_activity = Instant::now();
                 // Проснулась: его сообщение снимает сон и обнуляет счётчик
@@ -2172,6 +2529,34 @@ pub async fn run_telegram_mode(
                 continue;
             }
             "updateNewMessage" => {
+                // Гейт: (а) каналы новостей — сырьё в кэш, в ответ не идут;
+                // (б) чужие чаты — локдаун papik_only, тоже не отвечаем.
+                let dispatch_chat_id = v["message"]["chat_id"].as_i64().unwrap_or(0);
+                if dispatch_chat_id != 0
+                    && NEWS_CHANNELS.lock().unwrap().contains_key(&dispatch_chat_id)
+                {
+                    let title = NEWS_CHANNELS
+                        .lock()
+                        .unwrap()
+                        .get(&dispatch_chat_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(text) = news_message_text(&v["message"]) {
+                        push_news(NewsItem {
+                            chat_id: dispatch_chat_id,
+                            chat_title: title,
+                            message_id: v["message"]["id"].as_i64().unwrap_or(0),
+                            ts: v["message"]["date"].as_i64().unwrap_or(0),
+                            text,
+                        });
+                    }
+                    debug!("[news] live-пост из канала → кэш (не отвечаем)");
+                    continue;
+                }
+                if dispatch_chat_id != 0 && dispatch_chat_id != cfg.general.papik_chat_id {
+                    tracing::debug!("[tg] updateNewMessage из чата {} — локдаун papik_only, пропущено", dispatch_chat_id);
+                    continue;
+                }
                 handle_new_message(
                     v,
                     llm,

@@ -405,6 +405,7 @@ dependencies = [
  "furinya-llm",
  "furinya-sd",
  "furinya-vision",
+ "furinya-web",
  "libloading",
  "rand 0.8.7",
  "serde",
@@ -424,6 +425,15 @@ dependencies = [
  "image",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "furinya-web"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest",
 ]
 
 [[package]]

@@ -440,7 +440,7 @@ impl Tool {
 /// `send_telegram_message` с массивом частей (`parts`) — рантайм просто
 /// пересылает их с задержкой. Никакого парсинга `\n\n` на стороне Rust.
 /// Это надёжнее, чем неявные теги разделения.
-pub fn build_tools() -> Vec<Tool> {
+pub fn build_tools(cfg: &Config) -> Vec<Tool> {
     let str_arr = serde_json::json!({
         "type": "object",
         "properties": {
@@ -582,6 +582,61 @@ pub fn build_tools() -> Vec<Tool> {
             text_schema.clone(),
         ),
     ]
+    .into_iter()
+    .chain(web_tools(cfg))
+    .collect()
+}
+
+/// Инструменты «внешнего мира»: интернет-поиск и чтение страниц.
+/// Включаются только если capabilities.web_search.enabled = true.
+fn web_tools(cfg: &Config) -> Vec<Tool> {
+    if !cfg.capabilities.web_search.enabled {
+        return Vec::new();
+    }
+    let query_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Поисковый запрос.",
+            }
+        },
+        "required": ["query"]
+    });
+    let url_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "url": { "type": "string", "description": "Ссылка (http/https) для чтения." }
+        },
+        "required": ["url"]
+    });
+    let has_news = !cfg.misc.news_channels.is_empty();
+    vec![Tool::new(
+        "internet_search",
+        "Поиск в интернете: веб-результаты (ссылки+описания) и свежие новости \
+         по теме (Google News, с источниками и датами). Используй, когда не \
+         уверена или информация могла устареть, а также чтобы поддержать \
+         разговор о происходящем. Для деталей по обычной ссылке вызови web_open.",
+        query_schema,
+    ), Tool::new(
+        "web_open",
+        "Открыть страницу по ссылке и прочитать её текст (~2000 символов). \
+         Используй для деталей после internet_search.",
+        url_schema,
+    )]
+    .into_iter()
+    .chain(if has_news {
+        vec![Tool::new(
+            "fresh_news",
+            "Свежие заголовки из новостных каналов, которые ты читаешь \
+             (Россия + Нижний Новгород). Используй, когда хочешь поговорить \
+             о том, что происходит прямо сейчас.",
+            serde_json::json!({"type":"object","properties":{}}),
+        )]
+    } else {
+        Vec::new()
+    })
+    .collect()
 }
 
 /// Настройки сэмплинга, маппятся из Config.misc.

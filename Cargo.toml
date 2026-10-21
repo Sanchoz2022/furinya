@@ -5,6 +5,7 @@ members = [
     "crates/furinya-llm",
     "crates/furinya-diary",
     "crates/furinya-tg",
+    "crates/furinya-web",
     "crates/furinya-vision",
     "crates/furinya-audio",
     "crates/furinya-sd",
@@ -15,7 +16,7 @@ members = [
     "bins/file-consolidate",
     "bins/memory-build",
 ]
-default-members = ["crates/furinya-core", "crates/furinya-llm", "crates/furinya-diary", "crates/furinya-tg", "bins/furinya"]
+default-members = ["crates/furinya-core", "crates/furinya-llm", "crates/furinya-diary", "crates/furinya-tg", "crates/furinya-web", "bins/furinya"]
 
 [workspace.package]
 edition = "2024"

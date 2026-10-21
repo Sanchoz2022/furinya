@@ -11,6 +11,7 @@ furinya-diary = { path = "../furinya-diary" }
 furinya-vision = { path = "../furinya-vision" }
 furinya-audio = { path = "../furinya-audio" }
 furinya-sd = { path = "../furinya-sd" }
+furinya-web = { path = "../furinya-web" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libloading = "0.8"

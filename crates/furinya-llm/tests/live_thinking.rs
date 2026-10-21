@@ -90,7 +90,7 @@ async fn live_stream_native_tool_call() {
         Message::user("Привет!"),
     ];
 
-    let tools = build_tools();
+    let tools = build_tools(&cfg);
     let tool_calls = client
         .chat_stream(messages, Some(tools), |_d| {}, |_r| {})
         .await

@@ -95,6 +95,9 @@ type TdDestroy = unsafe extern "C" fn(*mut std::ffi::c_void);
 /// Безопасная обёртка над TDLib JSON-клиентом.
 ///
 /// Владеет каналом команд к worker-потоку. Сам handle НЕ хранит (он в потоке).
+/// Клон — дешёвый (канал команд + Arc-состояния), так что клиенты поллеров
+/// новостей и файловых загрузок ходят через свои клоны.
+#[derive(Clone)]
 pub struct TdClient {
     /// Команды worker-потоку. `None` = сигнал завершения (destroy + exit).
     cmd_tx: Sender<Option<String>>,

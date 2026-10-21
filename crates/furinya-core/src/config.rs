@@ -155,6 +155,17 @@ pub struct MiscConfig {
     /// Сколько последних своих реплик держать в кэше эмбеддингов анти-повтора.
     #[serde(default = "default_anti_repeat_history")]
     pub anti_repeat_max_history: usize,
+    /// Новостные каналы (usernames без @), которые бот читает для «актуальных
+    /// разговоров»: Россия + Нижний Новгород. Пусто = новости выключены.
+    #[serde(default)]
+    pub news_channels: Vec<String>,
+    /// Автоподписка на news_channels при старте (joinChat). false = только
+    /// читать уже подписанные.
+    #[serde(default = "default_true")]
+    pub news_auto_join: bool,
+    /// Период опроса каналов (сек). 0 = поллер выключен.
+    #[serde(default = "default_news_poll")]
+    pub news_poll_secs: u64,
     #[serde(default = "default_temp")]
     pub llm_temperature: f32,
     #[serde(default = "default_none_str")]
@@ -247,6 +258,10 @@ fn default_anti_repeat_avg() -> f32 {
 
 fn default_anti_repeat_history() -> usize {
     32
+}
+
+fn default_news_poll() -> u64 {
+    1800
 }
 fn default_temp() -> f32 {
     0.2

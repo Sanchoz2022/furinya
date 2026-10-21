@@ -1,0 +1,10 @@
+[package]
+name = "furinya-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+
+[dependencies]
+anyhow = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+chrono = "0.4"
