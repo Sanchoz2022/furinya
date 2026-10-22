@@ -325,8 +325,11 @@ pub async fn generate_image_aihorde(
         .generations
         .first()
         .ok_or_else(|| anyhow::anyhow!("AI Horde: пустой generations[]"))?;
-    if generation.censored && !cfg.nsfw {
-        anyhow::bail!("AI Horde: картинка помечена цензурой (censored=true)");
+    if generation.censored {
+        // Воркер с SFW-фильтром вернул чёрный квадрат вместо картинки.
+        // Это брак, а не результат: считаем задачу неудачей, чтобы верхний
+        // уровень откатился на локальный sd-server (он NSFW-совместим).
+        anyhow::bail!("AI Horde: картинка цензурирована воркером (черный квадрат)");
     }
 
     // img — либо https://... (R2), либо base64 (r2=false).
