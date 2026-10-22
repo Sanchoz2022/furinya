@@ -29,24 +29,76 @@ use std::time::{Duration, Instant};
     let backend = cfg.backend.trim().to_lowercase();
     match backend.as_str() {
         "aihorde" | "horde" => {
-            // Облако (SDXL-аниме: гетерохромия, NSFW, качество) — основной путь.
-            // Очередь Horde 10-25 минут, поэтому при сбое/таймауте отдаём
-            // локальный sd-server: он быстрый (SD1.5, ~2-3 мин) и всегда тут.
-            match generate_image_aihorde(&cfg.aihorde, prompt, negative_prompt, out_path).await {
-                Ok(p) => Ok(p),
-                Err(e) => {
-                    tracing::warn!("[sd] Horde не дал картинку ({e}) — откатываюсь на локальный sd-server");
-                    generate_image_a1111(
-                        &cfg.sd,
-                        &cfg.sd_render,
-                        prompt,
-                        negative_prompt,
-                        nsfw,
-                        out_path,
+            // Облако (SDXL-аниме: гетерохромия, NSFW, качество) — основной путь,
+            // но очередь Horde 10-30 минут. Локальный sd-server (SD1.5) быстрый
+            // (~2-3 мин). Поэтому гоним ОБА: кто первый — тот и ответ, но если
+            // локал готов, даём облаку ещё CLOUD_GRACE_SECS — облачная картинка
+            // качественнее, так что она приоритетнее.
+            const CLOUD_GRACE_SECS: u64 = 600;
+            let horde_path = out_path.with_extension("cloud.png");
+            let local_path = out_path.with_extension("local.png");
+            let horde = generate_image_aihorde(
+                &cfg.aihorde,
+                prompt,
+                negative_prompt,
+                &horde_path,
+            );
+            let local = generate_image_a1111(
+                &cfg.sd,
+                &cfg.sd_render,
+                prompt,
+                negative_prompt,
+                nsfw,
+                &local_path,
+            );
+            tokio::pin!(horde);
+            tokio::pin!(local);
+            let (winner, _was_cloud) = tokio::select! {
+                r = &mut horde => (r, true),
+                r = &mut local => {
+                    // Локальный готов: ещё 5 минут ждём облако.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(CLOUD_GRACE_SECS),
+                        &mut horde,
                     )
                     .await
+                    {
+                        Ok(r) => (r, true),
+                        Err(_) => (r, false),
+                    }
                 }
-            }
+            };
+            let (src, is_cloud) = match &winner {
+                Ok(_) => {
+                    if horde_path.exists() && local_path.exists() {
+                        // Оба успели — облачная лучше.
+                        (horde_path.clone(), true)
+                    } else if horde_path.exists() {
+                        (horde_path.clone(), true)
+                    } else {
+                        (local_path.clone(), false)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("[sd] облако не дало картинку ({e}) — откатываюсь на локальный sd-server");
+                    match local.await {
+                        Ok(p) => {
+                            let _ = std::fs::rename(&local_path, out_path);
+                            return Ok(p);
+                        }
+                        Err(e2) => anyhow::bail!("и облако, и локалный сервер не справились: {e} / {e2}"),
+                    }
+                }
+            };
+            let _ = std::fs::rename(&src, out_path);
+            let _ = std::fs::remove_file(&horde_path);
+            let _ = std::fs::remove_file(&local_path);
+            tracing::info!(
+                "[sd] фото готово ({}), {}",
+                out_path.display(),
+                if is_cloud { "облако SDXL" } else { "локальный SD1.5" }
+            );
+            Ok(out_path.display().to_string())
         }
         // Пустой backend и "sd" — локальный sd-server (наш основной).
         _ => {
