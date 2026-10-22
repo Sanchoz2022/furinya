@@ -6,5 +6,5 @@ rust-version = "1.97"
 
 [dependencies]
 anyhow = "1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "socks"] }
 chrono = "0.4"

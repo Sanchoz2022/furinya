@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use furinya_core::config::{AiHordeConfig, EndpointConfig, TakePhotoConfig};
+use furinya_core::config::{AiHordeConfig, EndpointConfig, SdRenderConfig, TakePhotoConfig};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 
@@ -29,10 +29,37 @@ use std::time::{Duration, Instant};
     let backend = cfg.backend.trim().to_lowercase();
     match backend.as_str() {
         "aihorde" | "horde" => {
-            generate_image_aihorde(&cfg.aihorde, prompt, negative_prompt, out_path).await
+            // Облако (SDXL-аниме: гетерохромия, NSFW, качество) — основной путь.
+            // Очередь Horde 10-25 минут, поэтому при сбое/таймауте отдаём
+            // локальный sd-server: он быстрый (SD1.5, ~2-3 мин) и всегда тут.
+            match generate_image_aihorde(&cfg.aihorde, prompt, negative_prompt, out_path).await {
+                Ok(p) => Ok(p),
+                Err(e) => {
+                    tracing::warn!("[sd] Horde не дал картинку ({e}) — откатываюсь на локальный sd-server");
+                    generate_image_a1111(
+                        &cfg.sd,
+                        &cfg.sd_render,
+                        prompt,
+                        negative_prompt,
+                        nsfw,
+                        out_path,
+                    )
+                    .await
+                }
+            }
         }
         // Пустой backend и "sd" — локальный sd-server (наш основной).
-        _ => generate_image_a1111(&cfg.sd, prompt, negative_prompt, nsfw, out_path).await,
+        _ => {
+            generate_image_a1111(
+                &cfg.sd,
+                &cfg.sd_render,
+                prompt,
+                negative_prompt,
+                nsfw,
+                out_path,
+            )
+            .await
+        }
     }
 }
 
@@ -310,6 +337,7 @@ struct Txt2ImgResponse {
 /// Hyper-SD LoRA (CPU-рендер ~3.5 минуты, экономим шаги).
 pub async fn generate_image_a1111(
     endpoint: &EndpointConfig,
+    render: &SdRenderConfig,
     prompt: &str,
     negative_prompt: &str,
     nsfw: bool,
@@ -327,25 +355,39 @@ pub async fn generate_image_a1111(
     if nsfw {
         furina_multiplier = 0.65;
         // Теги в начало (вес тегов в SD1.5 падает к концу промпта).
+        // «petite, small breasts» — по канону она маленькая и компактная;
+        // «wide hips» из старого префикса с ней спорил.
         if !prompt_final.contains("nsfw") {
-            prompt_final = format!("nsfw, nude, small breasts, wide hips, {prompt_final}");
+            prompt_final = format!("nsfw, nude, petite, slim body, small breasts, {prompt_final}");
         }
     }
+
+    // LoRA: из конфига. Если в конфиге пусто — берём исторический дефолт
+    // (furina + Hyper-SD 8-steps), иначе фото «поедут».
+    let loras: Vec<serde_json::Value> = if render.loras.is_empty() {
+        vec![
+            serde_json::json!({"path": "furina.safetensors", "multiplier": furina_multiplier}),
+            serde_json::json!({"path": "Hyper-SD15-8steps-lora.safetensors", "multiplier": 0.85}),
+        ]
+    } else {
+        render
+            .loras
+            .iter()
+            .map(|l| serde_json::json!({"path": l.path, "multiplier": l.multiplier}))
+            .collect()
+    };
 
     let body = serde_json::json!({
         "prompt": prompt_final,
         "negative_prompt": negative_prompt,
-        "lora": [
-            {"path": "furina.safetensors", "multiplier": furina_multiplier},
-            {"path": "Hyper-SD15-8steps-lora.safetensors", "multiplier": 0.85}
-        ],
-        "steps": 8,
-        "cfg_scale": 1.0,
-        "width": 512,
-        "height": 640,
-        "sampler_name": "euler_a",
-        "clip_skip": 2,
-        "seed": -1
+        "lora": loras,
+        "steps": render.steps,
+        "cfg_scale": render.cfg_scale,
+        "width": render.width,
+        "height": render.height,
+        "sampler_name": render.sampler_name,
+        "clip_skip": render.clip_skip,
+        "seed": render.seed
     });
 
     // Спецификация §3.2: CPU-сервер никогда не должен получать 2 параллельных

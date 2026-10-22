@@ -13,7 +13,8 @@ use furinya_diary::{
 };
 use std::collections::HashMap;
 use furinya_llm::{
-    LlmClient, Message, ToolCall, build_tools, extract_thinking, extract_thinking_from_content,
+    ContentPart, LlmClient, Message, MessageContent, ToolCall, build_tools, extract_thinking,
+    extract_thinking_from_content,
 };
 use furinya_vision::describe_photo;
 use furinya_audio::{synthesize_speech_openai, synthesize_fish_voice, transcribe_audio};
@@ -128,6 +129,121 @@ fn news_hint(max_items: usize, max_chars_each: usize) -> String {
         s.push_str(&format_news_line(it, max_chars_each));
         s.push('\n');
     }
+    s
+}
+
+// ── Фото: промпт → картинка ───────────────────────────────────────────────
+//
+// Проблемы, которые закрываем:
+//  1) LLM пишет сцену ПО-РУССКИ → SD1.5/SDXL русский не понимает → на выходе
+//     generic-портрет в каждом кадре («однотипно»). Лечится переводом.
+//  2) Канон внешности подставляется перед сценой, но модель часто дублирует
+//     его сама → промпт раздувается и веса тегов едут. Лечится дедупом.
+//  3) Модель рисует одну и ту же сцену → нужен принудительный разброс.
+
+/// Есть ли кириллица в строке (признак русского промпта).
+fn has_cyrillic(s: &str) -> bool {
+    s.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+}
+
+/// Переводит сцену на английский (теги для SD). Cold-модель: перевод не должен
+/// фантазировать.
+async fn translate_prompt_to_english(llm: &LlmClient, prompt: &str) -> anyhow::Result<String> {
+    let cool = llm.with_temperature(0.2);
+    let messages = vec![
+        Message::system(
+            "Ты переводишь описания сцен для генерации картинок (Stable Diffusion). \
+             Правила: 1) выход — ТОЛЬКО английский текст, без пояснений и кавычек; \
+             2) формат — короткие теги через запятую (как 'sitting by the window, holding a mug'); \
+             3) смысл, действие, внешний вид предметов и настроение сохраняй точно, \
+             ничего не добавляй от себя; 4) если в исходнике есть имя — оставь латиницей.",
+        ),
+        Message::user(prompt.to_string()),
+    ];
+    let resp = cool.chat(messages, None).await?;
+    let raw = resp
+        .choices
+        .first()
+        .map(|c| c.message.content.clone())
+        .unwrap_or_else(|| MessageContent::Text(String::new()));
+    // content — enum (Text | Parts): берём текстовую часть.
+    let text = match raw {
+        MessageContent::Text(t) => t,
+        MessageContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    let mut t = text.trim().trim_matches('"').trim().to_string();
+    // Модель любит завернуть перевод в «Prompt: ...» — срезаем.
+    if let Some(rest) = t.strip_prefix("Prompt:") {
+        t = rest.trim().trim_matches('"').trim().to_string();
+    }
+    if t.is_empty() {
+        anyhow::bail!("перевод пустой");
+    }
+    Ok(t)
+}
+
+/// Убирает из сцены теги, которые уже есть в каноне (модель их дублирует).
+fn dedupe_against_canon(scene: &str, canon: &str) -> String {
+    let canon_tokens: Vec<String> = canon
+        .split(',')
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let kept: Vec<&str> = scene
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            let low = t.to_lowercase();
+            !canon_tokens.iter().any(|c| {
+                c == &low || c.contains(&low) || low.contains(c.as_str())
+            })
+        })
+        .collect();
+    kept.join(", ")
+}
+
+/// Последний сгенерированный промпт — чтобы не повторять сцену.
+static LAST_PHOTO_PROMPT: std::sync::LazyLock<std::sync::Mutex<String>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(String::new()));
+
+/// Доля общих слов между двумя промптами (быстрая мера «та же сцена?»).
+fn scene_overlap(a: &str, b: &str) -> f32 {
+    let wa: Vec<String> = a
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+    if wa.is_empty() {
+        return 0.0;
+    }
+    let wb: Vec<String> = b
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() > 3)
+        .map(|w| w.to_lowercase())
+        .collect();
+    let hits = wa.iter().filter(|w| wb.contains(w)).count();
+    hits as f32 / wa.len() as f32
+}
+
+/// Если сцена похожа на прошлую — добавляем принудительный разброс.
+fn diversify_scene(scene: &str) -> String {
+    let mut s = scene.trim().to_string();
+    let last = LAST_PHOTO_PROMPT.lock().unwrap().clone();
+    if !last.is_empty() && scene_overlap(&s, &last) > 0.45 {
+        s.push_str(
+            ", different location, different camera angle, different pose, different outfit detail",
+        );
+    }
+    let mut guard = LAST_PHOTO_PROMPT.lock().unwrap();
+    *guard = s.clone();
     s
 }
 
@@ -514,6 +630,7 @@ async fn execute_tg_tool(
     client: &TdClient,
     chat_id: i64,
     message_id: i64,
+    llm: &LlmClient,
     diary: &Diary,
     diary_entries: &mut Vec<Entry>,
     cfg: &Config,
@@ -879,18 +996,37 @@ async fn execute_tg_tool(
                 .trim()
                 .trim_end_matches(['.', ','])
                 .to_string();
-            let prompt = prompt.trim().to_string();
+            let mut scene = prompt.trim().to_string();
+            // Сцена от LLM часто приходит ПО-РУССКИ. SD1.5/SDXL русский не
+            // понимает — она рисует generic-портрет и все фото выходят
+            // одинаковыми. Переводим (холодная модель, без выдумки).
+            if has_cyrillic(&scene) {
+                match translate_prompt_to_english(llm, &scene).await {
+                    Ok(t) => {
+                        info!("[tg] generate_image: сцена переведена на английский: {:?}", t);
+                        scene = t;
+                    }
+                    Err(e) => warn!("[tg] generate_image: перевод сцены не удался ({e}) — оставляю как есть"),
+                }
+            }
+            // Модель часто повторяет канон сама — выкидываем дубли, иначе
+            // веса тегов едут и промпт пухнет.
+            let scene = dedupe_against_canon(&scene, &canon_tags);
+            // Разброс: та же сцена, что и в прошлый раз, — запрещаем.
+            let scene = diversify_scene(&scene);
             let prompt = if canon_tags.is_empty() {
-                prompt
+                scene
             } else {
-                format!("{canon_tags}, {prompt}")
+                format!("{canon_tags}, {scene}")
             };
             // Дефолтный негатив: модель часто не заполняет negative_prompt, а
             // SD1.5-воркеры Horde без него выдают мусор (артифакты, лишние
             // пальцы, watermark). " ### " — Horde-синтаксис входа негатива.
             let negative_prompt = if negative_prompt.trim().is_empty() {
                 "worst quality, low quality, jpeg artifacts, watermark, text, signature, \
-                 blurry, deformed, bad anatomy, extra fingers, extra limbs, mutated, ugly"
+                 blurry, deformed, bad anatomy, extra fingers, extra limbs, mutated, ugly, \
+                 both eyes same color, symmetric eyes, cross-eyed, extra eyes, dull eyes, \
+                 same pose, same background, cropped head"
                     .to_string()
             } else {
                 negative_prompt
@@ -1600,6 +1736,7 @@ pub async fn handle_new_message(
                 client,
                 chat_id,
                 message_id,
+                llm,
                 diary,
                 diary_entries,
                 cfg,
@@ -2685,3 +2822,44 @@ pub async fn run_telegram_mode(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod photo_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn detects_cyrillic() {
+        assert!(has_cyrillic("сидит у окна с кружкой"));
+        assert!(!has_cyrillic("sitting by the window with a mug"));
+        assert!(!has_cyrillic("1girl, blue eyes"));
+    }
+
+    #[test]
+    fn dedupes_canon_tags() {
+        let canon = "white hair, cat ears, heterochromia, one eye deep blue";
+        // Модель часто повторяет канон сама — дубли должны уйти.
+        let scene = "white hair, cat ears, sitting on a chair, heterochromia";
+        let out = dedupe_against_canon(scene, canon);
+        assert!(out.contains("sitting on a chair"));
+        assert!(!out.contains("white hair"));
+        assert!(!out.contains("heterochromia"));
+    }
+
+    #[test]
+    fn overlap_detects_same_scene() {
+        let a = "sitting by the window at night holding a warm mug";
+        let b = "sitting by the window at night with a mug in hands";
+        let c = "standing on a rooftop at sunset with wind";
+        assert!(scene_overlap(a, b) > 0.5);
+        assert!(scene_overlap(a, c) < 0.3);
+    }
+
+    #[test]
+    fn diversify_adds_variation_for_repeated_scene() {
+        // Первая сцена — как есть, вторая (та же) — с принудительным разбросом.
+        let first = diversify_scene("sitting by the window at night holding a warm mug");
+        assert!(!first.contains("different location"));
+        let second = diversify_scene("sitting by the window at night holding a warm mug");
+        assert!(second.contains("different location"));
+    }
+}

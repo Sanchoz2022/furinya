@@ -356,6 +356,83 @@ pub struct TakePhotoConfig {
     pub sd: EndpointConfig,
     #[serde(default)]
     pub aihorde: AiHordeConfig,
+    /// Параметры рендера локального sd-server. Раньше были зашиты в код
+    /// (steps=8, cfg=1.0, euler_a, 512x640, две LoRA) — менять их приходилось
+    /// пересборкой. Теперь крутятся из конфига.
+    #[serde(default)]
+    pub sd_render: SdRenderConfig,
+}
+
+/// Параметры рендера локального sd-server (stable-diffusion.cpp).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SdRenderConfig {    /// Шаги. Hyper-SD 8-step: steps=8 при cfg≈1.0. Обычный сэмплинг: 25-30 при cfg 6-8.
+    #[serde(default = "default_sd_steps")]
+    pub steps: u32,
+    #[serde(default = "default_sd_cfg")]
+    pub cfg_scale: f32,
+    #[serde(default = "default_sd_sampler")]
+    pub sampler_name: String,
+    #[serde(default = "default_sd_width")]
+    pub width: u32,
+    #[serde(default = "default_sd_height")]
+    pub height: u32,
+    #[serde(default = "default_sd_clip_skip")]
+    pub clip_skip: i32,
+    /// LoRA: путь (имя файла в lora-model-dir) + сила.
+    #[serde(default)]
+    pub loras: Vec<SdLoraConfig>,
+    /// Сид: -1 = случайный (нужен для разнообразия).
+    #[serde(default = "default_sd_seed")]
+    pub seed: i64,
+}
+
+/// Одна LoRA для локального sd-server.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SdLoraConfig {
+    /// Имя файла в lora-model-dir (например "furina.safetensors").
+    pub path: String,
+    #[serde(default = "default_lora_multiplier")]
+    pub multiplier: f32,
+}
+
+fn default_sd_steps() -> u32 {
+    8
+}
+fn default_sd_cfg() -> f32 {
+    1.0
+}
+fn default_sd_sampler() -> String {
+    "euler_a".to_string()
+}
+fn default_sd_width() -> u32 {
+    512
+}
+fn default_sd_height() -> u32 {
+    640
+}
+fn default_sd_clip_skip() -> i32 {
+    2
+}
+fn default_sd_seed() -> i64 {
+    -1
+}
+fn default_lora_multiplier() -> f32 {
+    0.7
+}
+
+impl Default for SdRenderConfig {
+    fn default() -> Self {
+        Self {
+            steps: default_sd_steps(),
+            cfg_scale: default_sd_cfg(),
+            sampler_name: default_sd_sampler(),
+            width: default_sd_width(),
+            height: default_sd_height(),
+            clip_skip: default_sd_clip_skip(),
+            loras: Vec::new(),
+            seed: default_sd_seed(),
+        }
+    }
 }
 
 /// Конфиг AI Horde (https://aihorde.net/api/v2). Бесплатная краудсорс-генерация.
@@ -639,14 +716,19 @@ mod tests {
             "ministral-14b-2512"
         );
         assert!(cfg.capabilities.take_photo.enabled);
-        // Основной бэкенд — наш локальный sd-server (meinahentai, NSFW, ~3.5 мин);
-        // "aihorde" остаётся в конфиге как fallback облака.
-        assert_eq!(cfg.capabilities.take_photo.backend, "sd");
+        // Основной бэкенд фото — облако (Horde, SDXL-аниме: гетерохромия и
+        // NSFW); при сбое/таймауте furinya-sd сам откатывается на локальный
+        // sd-server (SD1.5, быстрый, NSFW-совместимый).
+        assert_eq!(cfg.capabilities.take_photo.backend, "aihorde");
         assert!(cfg
             .capabilities
             .take_photo
             .sd
             .base_url
             .contains("192.168.1.172:8082"));
+        // Параметры рендера — из конфига (раньше были зашиты в код).
+        assert_eq!(cfg.capabilities.take_photo.sd_render.steps, 8);
+        assert_eq!(cfg.capabilities.take_photo.sd_render.clip_skip, 2);
+        assert!(!cfg.capabilities.take_photo.sd_render.loras.is_empty());
     }
 }
