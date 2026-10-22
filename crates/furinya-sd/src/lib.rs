@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
                 &cfg.aihorde,
                 prompt,
                 negative_prompt,
+                nsfw,
                 &horde_path,
             );
             let local = generate_image_a1111(
@@ -209,6 +210,7 @@ pub async fn generate_image_aihorde(
     cfg: &AiHordeConfig,
     prompt: &str,
     negative_prompt: &str,
+    nsfw: bool,
     out_path: &std::path::Path,
 ) -> Result<String> {
     // Ключ: env FURINYA_HORDE_KEY перекрывает конфиг (удобно / секреты вне config).
@@ -217,6 +219,13 @@ pub async fn generate_image_aihorde(
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
         .unwrap_or_else(|| cfg.apikey.clone());
+    // NSFW-префикс — ТЕЖЕ, что и на локальном пути: без него SDXL-модель
+    // рисует «взрослую» фигуру вместо компактной (проверено: f1 против f6).
+    let prompt = if nsfw && !prompt.to_lowercase().contains("nsfw") {
+        format!("nsfw, nude, flat chest, small breasts, petite, slim waist, slight body, {prompt}")
+    } else {
+        prompt.to_string()
+    };
     // Негативный промпт в Horde вшивается в строку промпта через " ### ".
     let prompt_full = if negative_prompt.trim().is_empty() {
         prompt.to_string()
@@ -410,10 +419,13 @@ pub async fn generate_image_a1111(
     if nsfw {
         furina_multiplier = 0.65;
         // Теги в начало (вес тегов в SD1.5 падает к концу промпта).
-        // «petite, small breasts» — по канону она маленькая и компактная;
-        // «wide hips» из старого префикса с ней спорил.
+        // «компактность» на SDXL/Illustrious работает только через flat chest +
+        // slim waist + slight body: проверено вживую — «petite/small breasts»
+        // без них модель рисует полную фигуру (тест f1/f2 против f6).
         if !prompt_final.contains("nsfw") {
-            prompt_final = format!("nsfw, nude, petite, slim body, small breasts, {prompt_final}");
+            prompt_final = format!(
+                "nsfw, nude, flat chest, small breasts, petite, slim waist, slight body, {prompt_final}"
+            );
         }
     }
 
@@ -562,6 +574,7 @@ async fn live_aihorde_txt2img_writes_png() {
         &cfg,
         "cute catgirl portrait, aqua blue short hair, blue-white frilly dress, anime art, soft studio lighting, masterpiece",
         "blurry, lowres, extra fingers, deformed hands, watermark",
+        false,
         &out,
     )
     .await

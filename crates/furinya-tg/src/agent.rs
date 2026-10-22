@@ -210,6 +210,46 @@ fn dedupe_against_canon(scene: &str, canon: &str) -> String {
     kept.join(", ")
 }
 
+/// Убирает из сцены теги про глаза: канон задаёт их однозначно (гетерохромия),
+/// а LLM в сцене может ввернуть «green eyes» / «heterochromia» / «blue eyes» —
+/// и тогда глаза «разъезжаются» или ломаются. Канон должен побеждать всегда.
+fn strip_eye_tags(scene: &str) -> String {
+    const EYE_WORDS: [&str; 20] = [
+        "eye",
+        "eyes",
+        "heterochromia",
+        "heterochromatic",
+        "iris",
+        "irises",
+        "pupil",
+        "pupils",
+        "blue",
+        "green",
+        "red",
+        "gold",
+        "golden",
+        "amber",
+        "violet",
+        "purple",
+        "pink",
+        "brown",
+        "hazel",
+        "grey",
+    ];
+    scene
+        .split(',')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            let low = t.to_lowercase();
+            !EYE_WORDS.iter().any(|w| {
+                low.contains(&format!(" {w}")) || low.starts_with(w) || low.ends_with(w)
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Последний сгенерированный промпт — чтобы не повторять сцену.
 static LAST_PHOTO_PROMPT: std::sync::LazyLock<std::sync::Mutex<String>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(String::new()));
@@ -1012,6 +1052,8 @@ async fn execute_tg_tool(
             // Модель часто повторяет канон сама — выкидываем дубли, иначе
             // веса тегов едут и промпт пухнет.
             let scene = dedupe_against_canon(&scene, &canon_tags);
+            // Глаза задаёт канон (гетерохромия). Сцена их не перебивает.
+            let scene = strip_eye_tags(&scene);
             // Разброс: та же сцена, что и в прошлый раз, — запрещаем.
             let scene = diversify_scene(&scene);
             let prompt = if canon_tags.is_empty() {
@@ -1022,10 +1064,13 @@ async fn execute_tg_tool(
             // Дефолтный негатив: модель часто не заполняет negative_prompt, а
             // SD1.5-воркеры Horde без него выдают мусор (артифакты, лишние
             // пальцы, watermark). " ### " — Horde-синтаксис входа негатива.
+            // Глаза: «both eyes same color» — главный враг гетерохромии.
+            // Фигура: канон требует компактную — гасим «large breasts».
             let negative_prompt = if negative_prompt.trim().is_empty() {
                 "worst quality, low quality, jpeg artifacts, watermark, text, signature, \
                  blurry, deformed, bad anatomy, extra fingers, extra limbs, mutated, ugly, \
-                 both eyes same color, symmetric eyes, cross-eyed, extra eyes, dull eyes, \
+                 both eyes same color, matching eyes, symmetric eyes, cross-eyed, extra eyes, \
+                 dull eyes, large breasts, huge breasts, thick thighs, tall, \
                  same pose, same background, cropped head"
                     .to_string()
             } else {
@@ -2861,5 +2906,27 @@ mod photo_prompt_tests {
         assert!(!first.contains("different location"));
         let second = diversify_scene("sitting by the window at night holding a warm mug");
         assert!(second.contains("different location"));
+    }
+}
+
+#[cfg(test)]
+mod eye_tag_tests {
+    use super::*;
+
+    #[test]
+    fn strips_conflicting_eye_tags() {
+        let scene = "sitting by the window, green eyes, heterochromia, holding a mug, blue eyes";
+        let out = strip_eye_tags(scene);
+        assert!(out.contains("sitting by the window"));
+        assert!(out.contains("holding a mug"));
+        assert!(!out.contains("green eyes"));
+        assert!(!out.contains("heterochromia"));
+        assert!(!out.contains("blue eyes"));
+    }
+
+    #[test]
+    fn keeps_scene_without_eye_words() {
+        let scene = "on a rooftop at sunset, wind in her hair, cat ears";
+        assert_eq!(strip_eye_tags(scene), scene);
     }
 }
