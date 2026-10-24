@@ -1046,10 +1046,12 @@ async fn execute_tg_tool(
                     .saturating_add(rng.gen_range(0..500));
                 client.send_action_typing(chat_id);
                 tokio::time::sleep(Duration::from_millis(typing_ms)).await;
-                // Живость: в ~20% случаев отправляем с одной опечаткой и
-                // тут же редактируем на верный текст («перепечатала»).
+                // Живость: с вероятностью misc.liveliness_typo_probability
+                // отправляем с одной опечаткой и тут же редактируем на верный
+                // текст («перепечатала»).
                 // В контекст запись идёт КОРРЕКТНЫМ текстом (parts не тащим).
-                let to_send = if rng.gen_bool(0.20) {
+                let typo_p = cfg.misc.liveliness_typo_probability;
+                let to_send = if typo_p > 0.0 && rng.gen_bool(typo_p.min(1.0) as f64) {
                     match crate::corrupt_text_once(part) {
                         Some(bad) if bad != *part => {
                             client.queue_typo_fix(chat_id, part.clone());

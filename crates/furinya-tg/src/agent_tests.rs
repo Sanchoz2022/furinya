@@ -276,6 +276,7 @@ max_message_parts = 3
 llm_temperature = 0.85
 situation_recent_n = 6
 situation_top_k = 3
+liveliness_typo_probability = 0.0
 "#,
         diary_dir.display()
     );

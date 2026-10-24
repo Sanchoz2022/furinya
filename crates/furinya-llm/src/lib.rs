@@ -447,7 +447,7 @@ pub fn build_tools(cfg: &Config) -> Vec<Tool> {
             "parts": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Сообщение, разбитое на несколько коротких частей. Каждая часть — отдельное сообщение в Telegram."
+                "description": "Сообщение, разбитое на несколько коротких частей. Каждая часть — отдельное сообщение в Telegram. Каждая часть — самостоятельная ЗАКОНЧЕННАЯ фраза: не разрывай одно предложение на две части и не оставляй «хвост»-обрывок."
             }
         },
         "required": ["parts"]
@@ -1149,16 +1149,19 @@ impl LlmClient {
         }
         use futures_util::StreamExt;
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        // Байтовый буфер: многобайтовый UTF-8-символ может прийти частями в
+        // соседних сетевых чанках. Декодируем только целые строки (по b'\n'),
+        // тогда границы чанков не рвут символы.
+        let mut buf: Vec<u8> = Vec::new();
         // Аккумулятор native tool_calls (по index из стрима).
         let mut acc: Vec<ToolCall> = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            let text = String::from_utf8_lossy(&chunk);
-            buf.push_str(&text);
+            buf.extend_from_slice(&chunk);
             // SSE: строки "data: {...}\n\n"
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&line_bytes);
                 let line = line.trim();
                 if line.is_empty() {
                     continue;

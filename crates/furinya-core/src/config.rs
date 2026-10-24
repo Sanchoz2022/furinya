@@ -137,6 +137,11 @@ pub struct MiscConfig {
     pub typing_simulation_min_wpm: u32,
     #[serde(default = "default_typing_max")]
     pub typing_simulation_max_wpm: u32,
+    /// Вероятность «живой опечатки»: сообщение уходит с одной случайной
+    /// опечаткой в слове ≥5 букв и тут же редактируется на верный текст
+    /// (эффект «перепечатала»). 0 = выключено.
+    #[serde(default = "default_typo_prob")]
+    pub liveliness_typo_probability: f32,
     /// Мягкий лимит токенов контекста (грубая оценка chars/4). При превышении —
     /// включается рефлексия/консолидация памяти и укорачивание истории.
     #[serde(default = "default_ctx_limit")]
@@ -254,6 +259,9 @@ fn default_typing_min() -> u32 {
 }
 fn default_typing_max() -> u32 {
     150
+}
+fn default_typo_prob() -> f32 {
+    0.2
 }
 fn default_ctx_limit() -> u32 {
     20000
