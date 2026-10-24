@@ -209,6 +209,20 @@ pub struct MiscConfig {
     pub quiet_hours_start: u32,
     #[serde(default)]
     pub quiet_hours_end: u32,
+    /// Ситуационная память: сколько последних заметок (<diary_dir>/situation/
+    /// <chat_id>.md) подмешивать в контекст на первом ходу — непрерывность
+    /// «что происходит между нами прямо сейчас». 0 = не подмешивать.
+    #[serde(default = "default_situation_recent_n")]
+    pub situation_recent_n: usize,
+    /// Ситуационная память: сколько заметок достать семантически (top-K) по
+    /// свежему сообщению — чтобы всплыло похожее по смыслу из прошлого, а не
+    /// только хвост истории. 0 = выключить семантическую выборку.
+    #[serde(default = "default_situation_top_k")]
+    pub situation_top_k: usize,
+    /// Ситуационная память: сколько последних заметок держать на диске
+    /// (md + индекс). 0 = не удалять ничего (история растёт).
+    #[serde(default)]
+    pub situation_keep_entries: usize,
 }
 
 fn default_tool_reminder_prob() -> f32 {
@@ -286,6 +300,12 @@ fn default_idle_window_max() -> u64 {
 }
 fn default_idle_ping_max() -> u32 {
     3 // максимум 3 своих сообщения без ответа — дальше тишина
+}
+fn default_situation_recent_n() -> usize {
+    6 // последние 6 заметок — непрерывность ситуации
+}
+fn default_situation_top_k() -> usize {
+    3 // + семантический top-3 по свежему сообщению
 }
 
 /// Секция [capabilities] (пока только заглушки, расширяем по ходу)
@@ -701,11 +721,17 @@ mod tests {
         assert!(cfg.general.llm.endpoint.base_url.contains("api.mistral.ai"));
         assert_eq!(cfg.general.llm.endpoint.model, "ministral-8b-2512");
         assert_eq!(cfg.general.llm.endpoint.fallback_model, "ministral-14b-2512");
-        // Эмбеддинги: модель обязана лежать ВНУТРИ endpoint.* — иначе в запрос
-        // уходит пустой model и Mistral отвечает 400 «Invalid model: None»
-        // (консолидация тихо откатывается в ноль записей).
-        assert_eq!(cfg.general.embedding.endpoint.model, "mistral-embed-2312");
-        assert!(cfg.general.embedding.endpoint.base_url.contains("api.mistral.ai"));
+        // Эмбеддинги: Gemini embeddings (OpenAI-совместимый слой Google) —
+        // локальный llama.cpp на этом хосте считал запись ~4.6 с и грел железо.
+        // Модель обязана лежать ВНУТРИ endpoint.* — иначе в запрос уходит пустой
+        // model и бэкенд отвечает 400 (консолидация тихо откатывается в ноль).
+        assert_eq!(cfg.general.embedding.endpoint.model, "gemini-embedding-001");
+        assert!(cfg
+            .general
+            .embedding
+            .endpoint
+            .base_url
+            .contains("generativelanguage.googleapis.com"));
         // Vision на Mistral API: ПРОВЕРЕНО живьём — ministral-14b/8b
         // мультимодальные (писали описания картинок), medium/small — 429.
         assert_eq!(
@@ -716,10 +742,9 @@ mod tests {
             "ministral-14b-2512"
         );
         assert!(cfg.capabilities.take_photo.enabled);
-        // Основной бэкенд фото — облако (Horde, SDXL-аниме: гетерохромия и
-        // NSFW); при сбое/таймауте furinya-sd сам откатывается на локальный
-        // sd-server (SD1.5, быстрый, NSFW-совместимый).
-        assert_eq!(cfg.capabilities.take_photo.backend, "aihorde");
+        // Основной бэкенд фото — локальный sd-server (SD1.5, 512×640,
+        // meinahentai): облако (Horde) больше не используется.
+        assert_eq!(cfg.capabilities.take_photo.backend, "sd");
         assert!(cfg
             .capabilities
             .take_photo

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use furinya_core::config::Config;
 use furinya_core::prompts::Prompts;
 use furinya_diary::{
-    Diary, Entry, active_context, consolidate_memory, read_active,
+    Diary, Entry, SituationStore, active_context, consolidate_memory, read_active,
 };
 use std::collections::HashMap;
 use furinya_llm::{
@@ -24,6 +24,10 @@ use rand::Rng;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
+use crate::assessment::{
+    Assessment, build_assess_input, format_assessment, parse_assessment, read_chat_state,
+    write_chat_state,
+};
 use crate::{TdClient, UpdateLoop, auth, default_lib_path};
 
 // ── Новости из Telegram-каналов (актуальность для разговоров) ─────────────
@@ -142,32 +146,161 @@ fn news_hint(max_items: usize, max_chars_each: usize) -> String {
 //  3) Модель рисует одну и ту же сцену → нужен принудительный разброс.
 
 /// Есть ли кириллица в строке (признак русского промпта).
-fn has_cyrillic(s: &str) -> bool {
-    s.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
+// ── Stable Diffusion prompt engineering ──────────────────────────────────
+//
+// Порт kuni `ImageGenerator::engineerPrompt`: отдельный LLM-вызов превращает
+// свободное описание сцены в короткий danbooru-промпт на базе канона.
+// Раньше здесь стояли самодельные фильтры (strip_eye_tags и т.п.), которые
+// вырезали из сцены ЛЮБОЙ цвет («blue dress», «red rose», «golden sunlight»)
+// — из-за этого все фото выходили однотипными. Дизайн персонажа теперь держит
+// prompt-инженер, а сцена не теряет деталей.
+
+/// Явные NSFW-слова: обычной LLM их не показываем (может отказаться), но
+/// возвращаем в позитивный промпт после инжиниринга (трюк из kuni).
+const SD_NSFW_WORDS: &[&str] = &[
+    "explicit nudity",
+    "explicit nude",
+    "explicit erotic",
+    "pussy",
+    "breasts",
+    "nsfw",
+    "genital",
+    "vagina",
+    "penis",
+    "nude",
+    "naked",
+    "topless",
+    "nipples",
+    "areola",
+    "erotic",
+];
+
+/// Дефолтный негативный промпт для локального SD1.5.
+const DEFAULT_SD_NEGATIVE: &str = "worst quality, low quality, jpeg artifacts, watermark, \
+    text, signature, blurry, deformed, mutated, bad anatomy, bad hands, poorly drawn hands, \
+    missing fingers, fused fingers, extra fingers, extra hands, extra arms, extra limbs, \
+    malformed limbs, disconnected limbs, extra tail, multiple tails, two tails, \
+    ugly, both eyes same color, matching eyes, symmetric eyes, cross-eyed, extra eyes, \
+    dull eyes, large breasts, huge breasts, thick thighs, tall, same pose, same background, \
+    cropped head";
+
+/// Регистронезависимая замена подстроки (для вырезания NSFW-слов).
+fn replace_case_insensitive(haystack: &str, needle: &str, with: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let lower = haystack.to_lowercase();
+    let n = needle.to_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(&n) {
+        let abs = start + pos;
+        out.push_str(&haystack[start..abs]);
+        out.push_str(with);
+        start = abs + n.len();
+    }
+    out.push_str(&haystack[start..]);
+    out
 }
 
-/// Переводит сцену на английский (теги для SD). Cold-модель: перевод не должен
-/// фантазировать.
-async fn translate_prompt_to_english(llm: &LlmClient, prompt: &str) -> anyhow::Result<String> {
-    let cool = llm.with_temperature(0.2);
-    let messages = vec![
-        Message::system(
-            "Ты переводишь описания сцен для генерации картинок (Stable Diffusion). \
-             Правила: 1) выход — ТОЛЬКО английский текст, без пояснений и кавычек; \
-             2) формат — короткие теги через запятую (как 'sitting by the window, holding a mug'); \
-             3) смысл, действие, внешний вид предметов и настроение сохраняй точно, \
-             ничего не добавляй от себя; 4) если в исходнике есть имя — оставь латиницей.",
-        ),
-        Message::user(prompt.to_string()),
-    ];
-    let resp = cool.chat(messages, None).await?;
+/// Вырезает NSFW-слова из описания перед отправкой prompt-инженеру.
+fn sanitize_for_llm(scene: &str) -> String {
+    let mut out = scene.to_string();
+    for w in SD_NSFW_WORDS {
+        out = replace_case_insensitive(&out, w, "");
+    }
+    // Чистим осиротевшие запятые/двойные пробелы.
+    let mut cleaned = String::with_capacity(out.len());
+    for ch in out.chars() {
+        if ch == ',' {
+            if !cleaned.ends_with(',') && !cleaned.trim_end().is_empty() {
+                cleaned.push(ch);
+            }
+        } else if ch.is_whitespace() {
+            if !cleaned.ends_with(' ') {
+                cleaned.push(' ');
+            }
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
+        .trim_matches(|c: char| c == ',' || c.is_whitespace())
+        .to_string()
+}
+
+/// NSFW-слова, реально встречавшиеся в описании (возвращаем в промпт).
+fn explicit_words_in(scene: &str) -> Vec<&'static str> {
+    let lower = scene.to_lowercase();
+    SD_NSFW_WORDS
+        .iter()
+        .copied()
+        .filter(|w| lower.contains(w))
+        .collect()
+}
+
+/// Парсит JSON от prompt-инженера: допускает ```json ... ``` и лишний текст.
+fn parse_sd_json(content: &str) -> anyhow::Result<(String, String)> {
+    let mut s = content.trim();
+    if let Some(start) = s.find("```json") {
+        s = &s[start + 7..];
+        if let Some(end) = s.find("```") {
+            s = &s[..end];
+        }
+    } else if let Some(start) = s.find("```") {
+        s = &s[start + 3..];
+        if let Some(end) = s.find("```") {
+            s = &s[..end];
+        }
+    }
+    let start = s
+        .find('{')
+        .ok_or_else(|| anyhow::anyhow!("нет JSON-объекта в ответе prompt-инженера"))?;
+    let end = s
+        .rfind('}')
+        .ok_or_else(|| anyhow::anyhow!("нет конца JSON-объекта в ответе prompt-инженера"))?;
+    let v: Value = serde_json::from_str(&s[start..=end])?;
+    let positive = v
+        .get("positivePrompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let negative = v
+        .get("negativePrompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if positive.is_empty() {
+        anyhow::bail!("prompt-инженер вернул пустой positivePrompt");
+    }
+    Ok((positive, negative))
+}
+
+/// Обрезает промпт по тегам до `max_words` слов, не разрывая тег.
+fn clamp_prompt_words(prompt: &str, max_words: usize) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut words = 0usize;
+    for tag in prompt.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let n = tag.split_whitespace().count();
+        if words + n > max_words && !out.is_empty() {
+            break;
+        }
+        out.push(tag);
+        words += n;
+    }
+    out.join(", ")
+}
+
+/// Достаёт текст из ответа LLM (content — enum Text | Parts).
+fn response_text(resp: &furinya_llm::ChatResponse) -> String {
     let raw = resp
         .choices
         .first()
         .map(|c| c.message.content.clone())
         .unwrap_or_else(|| MessageContent::Text(String::new()));
-    // content — enum (Text | Parts): берём текстовую часть.
-    let text = match raw {
+    match raw {
         MessageContent::Text(t) => t,
         MessageContent::Parts(parts) => parts
             .iter()
@@ -177,133 +310,119 @@ async fn translate_prompt_to_english(llm: &LlmClient, prompt: &str) -> anyhow::R
             })
             .collect::<Vec<_>>()
             .join(" "),
-    };
-    let mut t = text.trim().trim_matches('"').trim().to_string();
-    // Модель любит завернуть перевод в «Prompt: ...» — срезаем.
-    if let Some(rest) = t.strip_prefix("Prompt:") {
-        t = rest.trim().trim_matches('"').trim().to_string();
     }
-    if t.is_empty() {
-        anyhow::bail!("перевод пустой");
-    }
-    Ok(t)
 }
 
-/// Убирает из сцены теги, которые уже есть в каноне (модель их дублирует).
-fn dedupe_against_canon(scene: &str, canon: &str) -> String {
-    let canon_tokens: Vec<String> = canon
+/// Канон для SD: заменяет обычные теги глаз на усиленную гетерохромию.
+/// Так глаза не «плывут» даже на широких/боковых кадрах.
+fn strengthen_eyes(canon: &str) -> String {
+    let kept: Vec<&str> = canon
         .split(',')
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let kept: Vec<&str> = scene
-        .split(',')
-        .map(|t| t.trim())
+        .map(str::trim)
         .filter(|t| !t.is_empty())
         .filter(|t| {
             let low = t.to_lowercase();
-            !canon_tokens.iter().any(|c| {
-                c == &low || c.contains(&low) || low.contains(c.as_str())
-            })
+            !low.contains("eye") && !low.contains("heterochromia")
         })
         .collect();
-    kept.join(", ")
+    format!(
+        "{}, (heterochromia:1.5), heterochromatic eyes, one purple eye, one blue eye",
+        kept.join(", ")
+    )
 }
 
-/// Убирает из сцены теги про глаза: канон задаёт их однозначно (гетерохромия),
-/// а LLM в сцене может ввернуть «green eyes» / «heterochromia» / «blue eyes» —
-/// и тогда глаза «разъезжаются» или ломаются. Канон должен побеждать всегда.
-fn strip_eye_tags(scene: &str) -> String {
-    const EYE_WORDS: [&str; 20] = [
-        "eye",
-        "eyes",
-        "heterochromia",
-        "heterochromatic",
-        "iris",
-        "irises",
-        "pupil",
-        "pupils",
-        "blue",
-        "green",
-        "red",
-        "gold",
-        "golden",
-        "amber",
-        "violet",
-        "purple",
-        "pink",
-        "brown",
-        "hazel",
-        "grey",
-    ];
-    scene
-        .split(',')
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .filter(|t| {
-            let low = t.to_lowercase();
-            !EYE_WORDS.iter().any(|w| {
-                low.contains(&format!(" {w}")) || low.starts_with(w) || low.ends_with(w)
-            })
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Последний сгенерированный промпт — чтобы не повторять сцену.
-static LAST_PHOTO_PROMPT: std::sync::LazyLock<std::sync::Mutex<String>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(String::new()));
-
-/// Доля общих слов между двумя промптами (быстрая мера «та же сцена?»).
-fn scene_overlap(a: &str, b: &str) -> f32 {
-    let wa: Vec<String> = a
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 3)
-        .map(|w| w.to_lowercase())
-        .collect();
-    if wa.is_empty() {
-        return 0.0;
+/// Убирает точные дубли тегов (безопасно, в отличие от подстрочного дедупа).
+fn dedupe_exact_tags(prompt: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for tag in prompt.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if seen.insert(tag.to_lowercase()) {
+            out.push(tag);
+        }
     }
-    let wb: Vec<String> = b
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 3)
-        .map(|w| w.to_lowercase())
-        .collect();
-    let hits = wa.iter().filter(|w| wb.contains(w)).count();
-    hits as f32 / wa.len() as f32
+    out.join(", ")
 }
 
-/// Если сцена похожа на прошлую — добавляем принудительный разброс.
-fn diversify_scene(scene: &str) -> String {
-    let mut s = scene.trim().to_string();
-    let last = LAST_PHOTO_PROMPT.lock().unwrap().clone();
-    if !last.is_empty() && scene_overlap(&s, &last) > 0.45 {
-        s.push_str(
-            ", different location, different camera angle, different pose, different outfit detail",
-        );
-    }
-    let mut guard = LAST_PHOTO_PROMPT.lock().unwrap();
-    *guard = s.clone();
-    s
-}
-
-/// Дробит ответ модели на части для отправки несколькими сообщениями.
-fn split_message(text: &str, max_parts: usize) -> Vec<String> {
-    let max_parts = max_parts.clamp(1, 10);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return vec![String::new()];
-    }
-    let parts: Vec<String> = trimmed
-        .split("\n\n")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if parts.len() >= 2 {
-        parts.into_iter().take(max_parts).collect()
+/// Порт kuni `engineerPrompt`, но с разделением труда: канон персонажа
+/// (тело, волосы, уши, хвост, глаза) собирается в Rust и всегда идёт первым,
+/// а LLM добавляет ТОЛЬКО теги сцены: действие, поза, ракурс, место, одежда,
+/// свет, настроение. Так модель не может потерять канон или заменить глаза.
+async fn engineer_sd_prompt(
+    llm: &LlmClient,
+    scene: &str,
+    nsfw: bool,
+) -> anyhow::Result<(String, String)> {
+    let cool = llm.with_temperature(0.5);
+    let nsfw_hint = if nsfw {
+        "The scene may imply adult intimacy, but do NOT write explicit sexual terms."
     } else {
-        vec![trimmed.to_string()]
+        ""
+    };
+    let system = format!(
+        r#"You are an expert Stable Diffusion prompt engineer for an anime SD1.5 model.
+The character's appearance (hair, cat ears, tail, heterochromia, body, face) is HARD-CODED
+and will be prepended automatically. Your job is ONLY the scene around her.
+
+POSITIVE PROMPT RULES:
+- English only. Comma-separated danbooru-style tags/keywords, NEVER full sentences.
+- Do NOT describe the character's hair, ears, tail, eyes, body, face or skin color.
+- Output ONLY scene tags: action/pose, camera angle, location, outfit, accessories,
+  lighting, time of day, mood, composition.
+- Preserve EVERY element of the desired photo: action, pose, held objects, location,
+  time of day, mood. Never drop the action or the objects.
+- Always include at least one concrete outfit tag that fits the scene (e.g. red knitted
+  sweater, black dress, oversized shirt, bikini). Vary outfits between scenes.
+- If the description contains action/motion (dancing, running, jumping, stretching,
+  fighting, playing), make the shot DYNAMIC: action shot, dynamic pose, motion,
+  flowing hair, flowing clothes, dynamic camera angle. Never answer an action scene
+  with a static standing pose.
+- If the description is a calm portrait/selfie, a calm pose is fine.
+- For close-up/portrait/selfie compositions, include "both eyes visible" so the
+  heterochromia reads clearly. Do not add it for profile/side views.
+- Include "selfie" or "photo" if it fits (most requests are selfies).
+- Do NOT request text, signs, posters or written words.
+- Keep it compact: at most 25 words. The full prompt (with the hard-coded character)
+  must stay under 60 words.
+- Vary composition: choose a fresh camera angle instead of a default front view.
+
+NEGATIVE PROMPT RULES:
+- Comma-separated tags: worst quality, low quality, blurry, jpeg artifacts, watermark,
+  signature, text, bad anatomy, bad hands, poorly drawn hands, missing fingers,
+  fused fingers, extra fingers, extra hands, extra arms, extra limbs, malformed limbs,
+  disconnected limbs, deformed, mutated, extra tail, multiple tails, two tails,
+  cropped, out of frame.
+- Always include these tags: both eyes same color, matching eyes.
+- Do NOT include character design tags in the negative prompt.
+
+{nsfw_hint}
+
+OUTPUT: strict JSON only, no markdown fences:
+{{"positivePrompt": "...", "negativePrompt": "..."}}"#,
+        nsfw_hint = nsfw_hint,
+    );
+    let messages = vec![
+        Message::system(system),
+        Message::user(format!("Desired photo: {scene}")),
+    ];
+    let resp = cool.chat(messages, None).await?;
+    let content = response_text(&resp);
+    let (positive, negative) = parse_sd_json(&content)?;
+    Ok((clamp_prompt_words(&positive, 25), negative))
+}
+
+/// Возвращает в готовый промпт NSFW-термины, вырезанные перед инженером.
+fn append_explicit_words(positive: &str, original_scene: &str) -> String {
+    let mut tags: Vec<String> = positive
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for w in explicit_words_in(original_scene) {
+        if !tags.iter().any(|t| t.eq_ignore_ascii_case(w)) {
+            tags.push(w.to_string());
+        }
     }
+    tags.join(", ")
 }
 
 /// Вырезает Gemma-теги `<|...|>` из текста (до парсинга JSON-аргументов).
@@ -497,6 +616,48 @@ fn take_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Создаёт `self_state.md` при старте, если его ещё нет.
+///
+/// Зачем: idle-шанс (5–15 мин) наступает РАНЬШЕ, чем консолидация-сон (15 мин),
+/// поэтому без бутстрапа первый шанс «написать первой» приходил бы с пустым
+/// состоянием — и модель молчала бы. Строим состояние из уже загруженной
+/// истории (тот же формат `[ДД.ММ ЧЧ:ММ] Имя: текст`, что и в консолидации).
+/// Идемпотентно: если файл есть — сразу выходим.
+async fn bootstrap_self_state(
+    llm: &LlmClient,
+    prompts: &Prompts,
+    cfg: &Config,
+    tg_history_full: &[(i64, bool, String, i64)],
+) {
+    let path = std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md");
+    if path.exists() {
+        return;
+    }
+    let mut chat_text = String::new();
+    for (sender, is_me, text, date) in tg_history_full {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let who = if *is_me {
+            cfg.general.character_name.clone()
+        } else if *sender == cfg.general.papik_chat_id {
+            cfg.general.papik_name.clone()
+        } else {
+            format!("user{}", sender)
+        };
+        chat_text.push_str(&format!("[{}] {}: {}\n", format_ts(*date), who, text));
+    }
+    // Температура как у консолидации (0.2): иначе модель уходит в
+    // мелодраматичный дрейф и нарушает запреты self_state-промпта.
+    // Логика генерации + guard от «нужды» — общая с консолидацией.
+    let cool = llm.with_temperature(0.2);
+    furinya_diary::consolidate::update_self_state(&cool, prompts, &cfg.misc.diary_dir, &chat_text)
+        .await;
+    if path.exists() {
+        info!("[tg] self_state создан при старте: {:?}", path);
+    }
+}
+
 /// Собирает блок памяти в рамках бюджета символов.
 /// Без этого память (дневник + выжимка чата) раздувала контекст до 100+ KB
 /// и упиралась в окно модели.
@@ -557,6 +718,12 @@ async fn extract_facts_to_diary(
 struct AntiRepeatState {
     emb_cache: HashMap<String, Vec<f32>>,
     head_start: f32,
+    /// Черновики, заблокированные анти-повтором В ЭТОМ ходу. Заблокированный
+    /// текст НЕ уходит в чат → он не попадает ни в историю, ни в `seen`, и
+    /// модель следующим вызовом отправляла его же (баг 23.10: блок «Вот так я
+    /// танцую…», а через 5 секунд тот же текст ушёл в чат). Держим их здесь и
+    /// сравниваем с ними следующие черновики.
+    blocked: Vec<String>,
 }
 
 impl AntiRepeatState {
@@ -564,8 +731,87 @@ impl AntiRepeatState {
         Self {
             emb_cache: HashMap::new(),
             head_start: 0.0,
+            blocked: Vec::new(),
         }
     }
+
+    /// Запоминает заблокированный черновик (кольцевой буфер, 32 штуки).
+    fn remember_blocked(&mut self, text: &str) {
+        let t = text.trim();
+        if t.is_empty() {
+            return;
+        }
+        self.blocked.push(t.to_string());
+        if self.blocked.len() > 32 {
+            let cut = self.blocked.len() - 32;
+            self.blocked.drain(..cut);
+        }
+    }
+}
+
+/// Порог лексической (символьные 3-граммы) похожести. Подобран на реальных
+/// репликах бота: дословные самоповторы дают 0.73–1.0, нормально разные —
+/// меньше 0.51 (даже с одинаковым обращением «моя кошечка» — 0.50).
+const LEXICAL_REPEAT_THRESHOLD: f32 = 0.68;
+
+/// Косинус символьных n-грамм (n=3) — локальная страховка от дословных
+/// самоповторов, работающая БЕЗ сети.
+///
+/// Mistral embeddings регулярно отвечают `429 backend_out_of_capacity`, и
+/// тогда эмбеддинг-анти-повтор молча пропускал копипасту собственных реплик
+/// («Ты — моя единственная ласка…» из хода в ход). Лексика ловит именно
+/// повторы, не задевая нормально разные ответы.
+fn lexical_similarity(a: &str, b: &str) -> f32 {
+    use std::collections::HashMap;
+    const N: usize = 3;
+
+    /// Нижний регистр, всё не-буквенно-цифровое → одиночный пробел,
+    /// пробелы схлопнуты, края обрезаны (как в калибровочной модели).
+    fn norm(s: &str) -> Vec<char> {
+        let mut out: Vec<char> = Vec::with_capacity(s.len());
+        for c in s.chars().flat_map(|c| c.to_lowercase()) {
+            let c = if c.is_alphanumeric() { c } else { ' ' };
+            if c == ' ' && (out.is_empty() || out.last() == Some(&' ')) {
+                continue;
+            }
+            out.push(c);
+        }
+        while out.last() == Some(&' ') {
+            out.pop();
+        }
+        out
+    }
+
+    fn grams(chars: &[char]) -> HashMap<Vec<char>, f64> {
+        let mut m: HashMap<Vec<char>, f64> = HashMap::new();
+        if chars.is_empty() {
+            return m;
+        }
+        if chars.len() < N {
+            *m.entry(chars.to_vec()).or_insert(0.0) += 1.0;
+            return m;
+        }
+        for w in chars.windows(N) {
+            *m.entry(w.to_vec()).or_insert(0.0) += 1.0;
+        }
+        m
+    }
+
+    let ga = grams(&norm(a));
+    let gb = grams(&norm(b));
+    if ga.is_empty() || gb.is_empty() {
+        return 0.0;
+    }
+    let dot: f64 = ga
+        .iter()
+        .map(|(k, va)| va * gb.get(k).copied().unwrap_or(0.0))
+        .sum();
+    let na: f64 = ga.values().map(|v| v * v).sum::<f64>().sqrt();
+    let nb: f64 = gb.values().map(|v| v * v).sum::<f64>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    (dot / (na * nb)) as f32
 }
 
 /// Эмбеддинг-защита от самоповторов — порт kuni (send_telegram_message.cpp,
@@ -593,6 +839,27 @@ async fn anti_repeat_check(
         || cfg.misc.anti_repeat_trigger_avg >= 1.0
     {
         return Ok(());
+    }
+    // ЛОКАЛЬНАЯ проверка (без сети) — первым делом: эмбеддинги Mistral
+    // постоянно лежат (429 backend_out_of_capacity), и без неё дословные
+    // самоповторы уходили в чат. Порог подобран так, что нормально разные
+    // реплики его не задевают.
+    let mut lex_max = 0.0f32;
+    let mut lex_quote = "";
+    for own in own_recent {
+        let sim = lexical_similarity(cand, own);
+        if sim > lex_max {
+            lex_max = sim;
+            lex_quote = own;
+        }
+    }
+    if lex_max > LEXICAL_REPEAT_THRESHOLD {
+        debug!(
+            "[tg] анти-повтор (лексика): {lex_max:.2} — черновик {:?} ≈ своё {:?}",
+            cand,
+            lex_quote.chars().take(60).collect::<String>()
+        );
+        return Err(format!("lexicalSimilarity={lex_max:.2}"));
     }
     // Чего не хватает в кэше — берём одной пачкой (Mistral: 1 RPS,
     // один batch-запрос вместо десятка одиночных).
@@ -673,6 +940,11 @@ async fn execute_tg_tool(
     llm: &LlmClient,
     diary: &Diary,
     diary_entries: &mut Vec<Entry>,
+    situation: &SituationStore,
+    // Сколько ещё сообщений разрешено отправить в этом ходу
+    // (`max_message_parts - parts_sent`). send_telegram_message не может
+    // превысить остаток — иначе вторым вызовом модель досылала ещё пачку.
+    parts_remaining: usize,
     cfg: &Config,
     own_recent: &[String],
     anti_repeat_prompt: &str,
@@ -710,8 +982,18 @@ async fn execute_tg_tool(
                     Vec::new(),
                 );
             }
-            // Живая очередь сообщений (spec от Саши: минимум 1, максимум 6;
-            // лучше меньше, но одно крупное сообщение тоже ок).
+            // Жёсткий потолок за ХОД (не за вызов): остаток бюджета приходит
+            // снаружи. Иначе модель первым вызовом слала 2, вторым — ещё 3.
+            if parts_remaining == 0 {
+                return (
+                    "Лимит сообщений на этот ход исчерпан — больше не отправляй, \
+                     коротко заверши мысль в уже отправленном или промолчи."
+                        .to_string(),
+                    Vec::new(),
+                );
+            }
+            // Живая очередь сообщений: цель — 1-2 части; жёсткий потолок —
+            // cfg.misc.max_message_parts (3). Лучше меньше, чем поток пингов.
             // Шаг 1 — склейка мелких частей: если оба соседних фрагмента короткие
             // (<40 симв) — сливаем в одно сообщение (до ~160 симв), чтобы вместо
             // 4 пшиков приходила 1 нормальная реплика.
@@ -729,14 +1011,23 @@ async fn execute_tg_tool(
                     _ => merged.push(p),
                 }
             }
-            let parts: Vec<_> = merged.into_iter().take(6).collect();
+            let parts: Vec<_> = merged
+                .into_iter()
+                .take(cfg.misc.max_message_parts.max(1).min(parts_remaining))
+                .collect();
             // Анти-повтор (порт kuni): черновик слишком похож на её недавние
             // реплики — не отправляем ВООБЩЕ (иначе повторится спарки «Мурр…
             // я тут» из хода в ход). Модель увидит anti_repeat-подсказку и
-            // переформулирует или промолчит.
+            // переформулирует или промолчит. Сравниваем и с частями ЭТОЙ пачки
+            // (part2 против part1), иначе модель шлёт два парафраза подряд.
+            // И — с черновиками, уже заблокированными в этом ходу: они не ушли
+            // в чат (нет в истории), но модель могла отправить их же снова.
+            let mut seen: Vec<String> = own_recent.to_vec();
+            seen.extend(rep.blocked.iter().cloned());
             for part in &parts {
-                if let Err(sim) = anti_repeat_check(part, own_recent, diary, cfg, rep).await {
+                if let Err(sim) = anti_repeat_check(part, &seen, diary, cfg, rep).await {
                     warn!("[tg] анти-повтор заблокировал отправку: {sim} — {:?}", part);
+                    rep.remember_blocked(part);
                     return (
                         format!(
                             "ПОВТОР ({sim}). Тот же смысл ты уже отправляла. {anti_repeat_prompt}"
@@ -744,6 +1035,7 @@ async fn execute_tg_tool(
                         Vec::new(),
                     );
                 }
+                seen.push(part.clone());
             }
             let mut rng = rand::thread_rng();
             for part in &parts {
@@ -859,6 +1151,53 @@ async fn execute_tg_tool(
                 Err(e) => format!("Дневник: ошибка эмбеддинга запроса: {e}"),
             };
             (res, Vec::new())
+        }
+        "situation" => {
+            // Модель сама достаёт фрагмент ситуационной памяти: конкретную
+            // заметку (number), последние подряд (last) и/или похожее по
+            // смыслу (query). Свежие заметки и так уже в контексте.
+            let v: Value = serde_json::from_str(args).unwrap_or(Value::Null);
+            let number = v.get("number").and_then(|x| x.as_u64());
+            let last = v.get("last").and_then(|x| x.as_u64());
+            let query = v
+                .get("query")
+                .and_then(|q| q.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+
+            let mut chunks: Vec<String> = Vec::new();
+            if let Some(n) = number {
+                match situation.block_by_number(n as u32) {
+                    Some(b) => chunks.push(b),
+                    None => chunks.push(format!("Заметки №{n} нет.")),
+                }
+            }
+            if let Some(k) = last {
+                let r = situation.recent(k as usize);
+                if !r.trim().is_empty() {
+                    chunks.push(r);
+                }
+            }
+            if let Some(q) = query {
+                let r = situation
+                    .search(diary.embedding(), q, cfg.misc.situation_top_k.max(3))
+                    .await;
+                if !r.trim().is_empty() {
+                    chunks.push(format!("[похожее по смыслу на «{q}»]\n{r}"));
+                }
+            }
+            if chunks.is_empty() {
+                let r = situation.recent(5);
+                chunks.push(if r.trim().is_empty() {
+                    "Ситуационных заметок пока нет.".to_string()
+                } else {
+                    r
+                });
+            }
+            (
+                format!("Ситуационная память:\n{}", chunks.join("\n\n")),
+                Vec::new(),
+            )
         }
         "stay_quiet" => {
             // Модель САМА решила промолчать. В чат не уходит ничего —
@@ -996,26 +1335,28 @@ async fn execute_tg_tool(
                     )
                 }
             };
-            let prompt = v
+            let raw_prompt = v
                 .get("prompt")
                 .and_then(|p| p.as_str())
                 .unwrap_or("")
+                .trim()
                 .to_string();
-            if prompt.trim().is_empty() {
+            if raw_prompt.is_empty() {
                 return (
                     "ОШИБКА: generate_image получил пустой prompt.".to_string(),
                     Vec::new(),
                 );
             }
-            let negative_prompt = v
+            let explicit_negative = v
                 .get("negative_prompt")
                 .and_then(|p| p.as_str())
                 .unwrap_or("")
+                .trim()
                 .to_string();
-            // NSFW — только явным флагом от модели (特殊 perms: приватный чат с
-            // Сашей). Если模型 забыл указать, но промпт открытый — верим промпту.
+            // NSFW — только явным флагом от модели (приватный чат с Сашей).
+            // Если модель забыла указать, но промпт открытый — верим промпту.
             let mut nsfw = v.get("nsfw").and_then(|p| p.as_bool()).unwrap_or(false);
-            let p_lower = prompt.to_lowercase();
+            let p_lower = raw_prompt.to_lowercase();
             if !nsfw
                 && (p_lower.contains("nsfw")
                     || p_lower.contains("nude")
@@ -1027,54 +1368,59 @@ async fn execute_tg_tool(
             {
                 nsfw = true;
             }
-            // Канон внешки: теги из prompts/character_appearance.md ВСЕГДА
-            // идут в начало промпта. Раньше модель сочиняла вид каждый раз
-            // заново → картинки были "всратые и очень разные". Теперь стиль и
-            // персонаж постоянны, LLM добавляет только сцену/позу/настроение.
+            // Канон: тело + внешность. Глаза принудительно усиливаем до
+            // гетерохромии 1.5 — иначе на широких/боковых кадрах она бледная.
+            // Канон идёт в промпт ВСЕГДА и не зависит от LLM.
+            let body_tags = std::fs::read_to_string("prompts/character_body.md")
+                .unwrap_or_default()
+                .trim()
+                .trim_end_matches(['.', ','])
+                .to_string();
             let canon_tags = std::fs::read_to_string("prompts/character_appearance.md")
                 .unwrap_or_default()
                 .trim()
                 .trim_end_matches(['.', ','])
                 .to_string();
-            let mut scene = prompt.trim().to_string();
-            // Сцена от LLM часто приходит ПО-РУССКИ. SD1.5/SDXL русский не
-            // понимает — она рисует generic-портрет и все фото выходят
-            // одинаковыми. Переводим (холодная модель, без выдумки).
-            if has_cyrillic(&scene) {
-                match translate_prompt_to_english(llm, &scene).await {
-                    Ok(t) => {
-                        info!("[tg] generate_image: сцена переведена на английский: {:?}", t);
-                        scene = t;
-                    }
-                    Err(e) => warn!("[tg] generate_image: перевод сцены не удался ({e}) — оставляю как есть"),
-                }
-            }
-            // Модель часто повторяет канон сама — выкидываем дубли, иначе
-            // веса тегов едут и промпт пухнет.
-            let scene = dedupe_against_canon(&scene, &canon_tags);
-            // Глаза задаёт канон (гетерохромия). Сцена их не перебивает.
-            let scene = strip_eye_tags(&scene);
-            // Разброс: та же сцена, что и в прошлый раз, — запрещаем.
-            let scene = diversify_scene(&scene);
-            let prompt = if canon_tags.is_empty() {
-                scene
+            let canon = [body_tags, strengthen_eyes(&canon_tags)]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // NSFW-термины вырезаем перед инженером (LLM может отказаться),
+            // вернём их в позитивный промпт после (трюк kuni).
+            let scene_for_llm = if nsfw {
+                sanitize_for_llm(&raw_prompt)
             } else {
-                format!("{canon_tags}, {scene}")
+                raw_prompt.clone()
             };
-            // Дефолтный негатив: модель часто не заполняет negative_prompt, а
-            // SD1.5-воркеры Horde без него выдают мусор (артифакты, лишние
-            // пальцы, watermark). " ### " — Horde-синтаксис входа негатива.
-            // Глаза: «both eyes same color» — главный враг гетерохромии.
-            // Фигура: канон требует компактную — гасим «large breasts».
-            let negative_prompt = if negative_prompt.trim().is_empty() {
-                "worst quality, low quality, jpeg artifacts, watermark, text, signature, \
-                 blurry, deformed, bad anatomy, extra fingers, extra limbs, mutated, ugly, \
-                 both eyes same color, matching eyes, symmetric eyes, cross-eyed, extra eyes, \
-                 dull eyes, large breasts, huge breasts, thick thighs, tall, \
-                 same pose, same background, cropped head"
-                    .to_string()
+            info!(
+                "[tg] generate_image: сцена от LLM={:?} (nsfw={nsfw})",
+                raw_prompt
+            );
+            // LLM добавляет ТОЛЬКО сцену: действие, ракурс, одежду, свет.
+            let (scene_positive, engineered_negative) =
+                match engineer_sd_prompt(llm, &scene_for_llm, nsfw).await {
+                    Ok((p, n)) => (p, n),
+                    Err(e) => {
+                        warn!(
+                            "[tg] generate_image: prompt-инженер упал ({e}) — fallback на прямой конкат"
+                        );
+                        (scene_for_llm.clone(), String::new())
+                    }
+                };
+            let mut positive = dedupe_exact_tags(&format!("{canon}, {scene_positive}"));
+            // NSFW-термины из исходного описания возвращаем в промпт (их не
+            // видел prompt-инженер, иначе мог отказаться).
+            if nsfw {
+                positive = append_explicit_words(&positive, &raw_prompt);
+            }
+            // Негатив: явный аргумент модели → негатив инженера → дефолт.
+            let negative_prompt = if !explicit_negative.is_empty() {
+                explicit_negative
+            } else if !engineered_negative.trim().is_empty() {
+                engineered_negative
             } else {
-                negative_prompt
+                DEFAULT_SD_NEGATIVE.to_string()
             };
             // Куда сохраняем сгенерированный PNG.
             let out_dir = std::env::temp_dir();
@@ -1083,11 +1429,14 @@ async fn execute_tg_tool(
                 Utc::now().format("%Y%m%d_%H%M%S")
             );
             let out_path = out_dir.join(&fname);
-            info!("[tg] generate_image: промпт={:?} → бэкенд {} (nsfw={nsfw})", prompt, cfg.capabilities.take_photo.backend);
+            info!(
+                "[tg] generate_image: positive={:?} negative={:?} → бэкенд {} (nsfw={nsfw})",
+                positive, negative_prompt, cfg.capabilities.take_photo.backend
+            );
             client.send_action_typing(chat_id);
             match generate_image(
                 &cfg.capabilities.take_photo,
-                &prompt,
+                &positive,
                 &negative_prompt,
                 nsfw,
                 &out_path,
@@ -1100,7 +1449,7 @@ async fn execute_tg_tool(
                     info!("[tg] generate_image: отправлено фото {}", path);
                     (
                         format!("Изображение сгенерировано и отправлено: {path}"),
-                        vec![format!("[я отправила ФОТО (промпт): {prompt}]")],
+                        vec![format!("[я отправила ФОТО (промпт): {positive}]")],
                     )
                 }
                 Err(e) => {
@@ -1159,9 +1508,14 @@ async fn execute_tg_tool(
                 );
             }
             // Анти-повтор: то же самое для голосовых (ночные обнимашки шли
-            // одной и той же фразой).
-            if let Err(sim) = anti_repeat_check(&voice_text, own_recent, diary, cfg, rep).await {
+            // одной и той же фразой). Учитываем и ранее заблокированные
+            // черновики этого хода — иначе модель повторяла заблокированную
+            // фразу следующим вызовом.
+            let mut voice_seen: Vec<String> = own_recent.to_vec();
+            voice_seen.extend(rep.blocked.iter().cloned());
+            if let Err(sim) = anti_repeat_check(&voice_text, &voice_seen, diary, cfg, rep).await {
                 warn!("[tg] анти-повтор заблокировал голосовое: {sim}");
+                rep.remember_blocked(&voice_text);
                 return (
                     format!(
                         "ПОВТОР ({sim}). То же самое ты уже отправляла голосом. {anti_repeat_prompt}"
@@ -1272,6 +1626,15 @@ pub async fn handle_new_message(
         debug!("[tg] пропускаю собственное исходящее сообщение (sender={})", sender);
         return;
     }
+
+    // ── Ситуационная память этого чата ────────────────────────────────────
+    // Атомарная последовательная история «что происходит между нами прямо
+    // сейчас» (data/diary/situation/<chat_id>.md). Читаем на turn 1, пишем
+    // одну заметку после обмена (в конце функции).
+    let situation = SituationStore::new(&cfg.misc.diary_dir, chat_id);
+    // Длина полной истории на входе — по ней в конце поймём, был ли реальный
+    // обмен (стоит ли писать заметку). Считаем ДО добавления его сообщения.
+    let hist_len_before = tg_history_full.len();
 
     // Живой статус: приходит живое сообщение от человека → на минуту "В сети".
     // Через тишину статус снова сбрасывается (см. timeout-ветку главного цикла).
@@ -1429,6 +1792,90 @@ pub async fn handle_new_message(
     let ts = format_ts(date);
     println!("\n[tg] {} [{}]: {}", sender_name, ts, effective_text);
 
+    // Его слова БЕЗ служебных обёрток (фото/голос) — для оценки хода.
+    let his_words = if !text.trim().is_empty() {
+        text.clone()
+    } else {
+        photo_description
+            .clone()
+            .or_else(|| voice_text.clone())
+            .unwrap_or_default()
+    };
+
+    // ── Оценка хода (внутренний разбор перед ответом) ─────────────────────
+    // kuni получал оценку состояния/намерения собеседника прямо в ответе
+    // (`- thought:`/`- emotion:`). Rust-порт ждал native `reasoning_content`,
+    // которого `ministral-8b-2512` НЕ отдаёт → этап оценки просто исчез, и
+    // бот отвечал generic-заглушками («я тут немного зависла…»).
+    //
+    // Поэтому оценка — ОТДЕЛЬНЫЙ дешёвый LLM-вызов (temp 0.3, без tools):
+    // модель возвращает три строки — СОСТОЯНИЕ ОН / СОСТОЯНИЕ Я / ПЛАН.
+    // Дальше блок инжектится в system-промпт хода («Оценка хода»), а per-chat
+    // состояние пишется в data/diary/chat_state/<chat_id>.md.
+    let assessment: Option<Assessment> = if !is_idle && !his_words.trim().is_empty() {
+        let assess_prompt = prompts.assess();
+        if assess_prompt.trim().is_empty() {
+            warn!("[tg] промпт оценки (assess.md) отсутствует — ход без оценки");
+            None
+        } else {
+            let diary_dir = std::path::Path::new(&cfg.misc.diary_dir);
+            let prev_state = read_chat_state(diary_dir, chat_id);
+            // Хвост истории: последние реплики (её и его) ДО его текущего
+            // сообщения — оно идёт в оценку отдельно, без обёрток (голос/фото).
+            let hist_end = tg_history_full.len().saturating_sub(1);
+            let hist_start = hist_end.saturating_sub(6);
+            let hist_tail = situation_exchange_text(cfg, &tg_history_full[hist_start..hist_end]);
+            let input = build_assess_input(&his_words, &hist_tail, &prev_state);
+            // Пока идёт оценка — показываем «печатает…»: иначе пользователь
+            // видит тишину несколько секунд и думает, что бот завис.
+            client.send_action_typing(chat_id);
+            let assess_llm = llm.with_temperature(0.3);
+            let call = assess_llm
+                .chat(vec![Message::system(assess_prompt), Message::user(input)], None);
+            match tokio::time::timeout(Duration::from_secs(20), call).await {
+                Ok(Ok(resp)) => {
+                    let raw = resp
+                        .choices
+                        .first()
+                        .and_then(|c| match &c.message.content {
+                            MessageContent::Text(s) => Some(s.clone()),
+                            MessageContent::Parts(_) => None,
+                        })
+                        .unwrap_or_default();
+                    match parse_assessment(&raw) {
+                        Some(a) => {
+                            info!(
+                                "[tg] ОЦЕНКА ХОДА:\n  ОН: {}\n  Я: {}\n  ПЛАН: {}",
+                                a.he, a.me, a.plan
+                            );
+                            Some(a)
+                        }
+                        None => {
+                            warn!("[tg] оценка хода: модель не вернула 3 строки — ход без оценки");
+                            None
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!("[tg] оценка хода: LLM ошибка ({e}) — ход без оценки");
+                    None
+                }
+                Err(_) => {
+                    warn!("[tg] оценка хода: таймаут 20с — ход без оценки");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+    // System-промпт хода: базовый + внутренняя оценка (её видит и на
+    // последующих итерациях tool-loop).
+    let system_prompt = match &assessment {
+        Some(a) => format!("{}\n\n{}", tg_system_prompt, format_assessment(a)),
+        None => tg_system_prompt.to_string(),
+    };
+
     // Технические команды (consolidate/save/exit) НЕ обрабатываются в TG —
     // только в локальный stdin (см. main.rs). В TG игнорируем их полностью.
     //
@@ -1439,11 +1886,16 @@ pub async fn handle_new_message(
     let max_turns = 8;
     let mut ask_exhausted = false;
     let mut final_sent_via_tool = false;
-    // Сколько сообщений отправили за весь вызов (максимум 2) — чтобы после
-    // ответа модель не заваливала чат.
-    let mut message_sends = 0;
+    // Сколько ЧАСТЕЙ (реальных сообщений) ушло за ход — жёсткий гейт против
+    // «потопа» (раньше после анти-повтора ход шёл до max_turns и слал 2+2+3).
+    let mut parts_sent = 0usize;
     // Модель САМА выбрала промолчать (stay_quiet) — ход закрывается тишиной.
     let mut chose_quiet = false;
+    // Инструмент не выполнен: stay_quiet на живом сообщении, текст на голосовое,
+    // кривой JSON в send_telegram_message. Ход в этом случае НЕ закрываем —
+    // даём модели ещё один ход ответить. Раньше здесь падало в canned-заглушку
+    // («Сашенька, я чуть зависла…») — ровно тот дежурный ответ, который чиним.
+    let mut tool_blocked = false;
     // Инструментальный диалог ЭТОГО вызова (assistant tool_calls → tool-результаты).
     // Ничего с role=tool не должно попадать в tg_history: «осиротевший» tool
     // без предшествующего assistant.tool_calls роняет Mistral ошибкой
@@ -1452,16 +1904,19 @@ pub async fn handle_new_message(
     // Анти-повтор (порт kuni): кэш эмбеддингов живёт на один вызов хода —
     // черновики отправок сравниваются с её недавними репликами из истории.
     let mut rep_state = AntiRepeatState::new();
-    // Ход, в котором анти-повтор вернул ПОВТОР-нудж: canned-фолбэки после него
-    // запрещены (тишина/переписывание лучше «я чуть зависла…» — это тоже спам).
-    let mut repeat_nudged = false;
     let anti_repeat_prompt = prompts
         .extra
         .get("anti_repeat")
         .cloned()
         .unwrap_or_default();
     for turn in 1..=max_turns {
-        let mut messages = vec![Message::system(tg_system_prompt.to_string())];
+        // Ход, в котором анти-повтор вернул ПОВТОР-нудж: canned-фолбэки после
+        // него запрещены (тишина/переписывание лучше «я чуть зависла…» — это
+        // тоже спам). Нудж живёт ОДИН ход — объявляем его здесь, на каждой
+        // итерации, иначе он тащится дальше и гонит цикл до max_turns
+        // (из-за этого бот слал пачки 2+2+3 сообщений подряд).
+        let mut repeat_nudged = false;
+        let mut messages = vec![Message::system(system_prompt.clone())];
         if turn == 1 {
             // RAG-запрос: текст, а если его нет — описание фото/расшифровка голоса.
             let rag_query = if !text.trim().is_empty() {
@@ -1527,6 +1982,60 @@ pub async fn handle_new_message(
                 }
             }
 
+            // Её СОБСТВЕННОЕ состояние (data/diary/self_state.md): настроение,
+            // чем занята, мысли. Это Я, НЕ пользователь — даёт живой материал,
+            // чтобы писать первой своё, а не дежурное «ты тут?».
+            let self_state_path = std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md");
+            if let Ok(self_state) = std::fs::read_to_string(&self_state_path) {
+                let self_state = self_state.trim();
+                if !self_state.is_empty() {
+                    let block = take_chars(self_state, 1200);
+                    injected_chars += block.chars().count();
+                    messages.push(Message::user(format!(
+                        "Моё текущее состояние (это Я, не пользователь):\n{block}"
+                    )));
+                }
+            }
+
+            // Per-chat состояние «моё состояние с ним» — моя оценка его и моего
+            // состояния по ПРОШЛОМУ ходу (data/diary/chat_state/<chat_id>.md).
+            // Даёт связность между ходами и работает как страховка, если свежая
+            // оценка не удалась (таймаут/ошибка LLM).
+            let chat_state = read_chat_state(std::path::Path::new(&cfg.misc.diary_dir), chat_id);
+            let chat_state = chat_state.trim();
+            if !chat_state.is_empty() {
+                let block = take_chars(chat_state, 600);
+                injected_chars += block.chars().count();
+                messages.push(Message::user(format!(
+                    "Моё состояние с ним (моя оценка его и моего состояния, прошлый ход):\n{block}"
+                )));
+            }
+
+            // Ситуационная память: последние N заметок (непрерывность «что
+            // происходит между нами прямо сейчас») + семантический top-K по
+            // свежему сообщению (похожее по смыслу из прошлого). Это МОИ слова
+            // о ситуации, не слова пользователя. Полный фрагмент достаётся
+            // тулом `situation`.
+            let mut sit_block = situation.recent(cfg.misc.situation_recent_n);
+            if cfg.misc.situation_top_k > 0 && !rag_query.trim().is_empty() {
+                let top = situation
+                    .search(diary.embedding(), &rag_query, cfg.misc.situation_top_k)
+                    .await;
+                if !top.trim().is_empty() && !sit_block.contains(top.trim()) {
+                    if !sit_block.trim().is_empty() {
+                        sit_block.push_str("\n\n[похожее по смыслу к его сообщению]\n");
+                    }
+                    sit_block.push_str(&top);
+                }
+            }
+            if !sit_block.trim().is_empty() {
+                let block = take_chars(&sit_block, 2000);
+                injected_chars += block.chars().count();
+                messages.push(Message::user(format!(
+                    "Текущая ситуация (мои заметки: что происходит, его состояние, моё состояние — это МОИ слова, не пользователь):\n{block}"
+                )));
+            }
+
             // Активный контекст памяти: топ-K самых свежих НЕ-битых записей
             // дневника (data/diary/<ts>.md). Источник правды — active.txt.
             let (_active_ts, corrupt) = read_active(&cfg.misc.diary_dir);
@@ -1545,7 +2054,7 @@ pub async fn handle_new_message(
                 }
             }
             info!(
-                "[tg] память в контексте: {} символов (хиты+профиль+выжимка+актив)",
+                "[tg] память в контексте: {} символов (хиты+профиль+выжимка+состояние+ситуация+актив)",
                 injected_chars
             );
         }
@@ -1662,14 +2171,12 @@ pub async fn handle_new_message(
                     .to_string(),
             ));
             if turn == max_turns {
-                let reply = "Сашенька, я чуть зависла... но я с тобой! 🥰 Расскажи ещё что-нибудь?";
-                for chunk in split_message(reply, cfg.misc.max_message_parts) {
-                    client.send_action_typing(chat_id);
-                    client.send_text(chat_id, &chunk);
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-                remember_in_history(tg_history, Message::assistant(reply.to_string()));
-                record_my_send(tg_history, tg_history_full, my_id, cfg, &[reply.to_string()]);
+                // Модель так и не позвала инструмент — generic-заглушка запрещена:
+                // лучше тишина, чем «Сашенька, я чуть зависла…».
+                warn!(
+                    "[tg] модель не вернула tool_call за {} ходов — молчим",
+                    max_turns
+                );
                 break;
             }
             continue;
@@ -1703,20 +2210,21 @@ pub async fn handle_new_message(
         for (call_idx, tc) in tool_calls.iter().enumerate() {
             let call_id = turn_calls[call_idx].id.clone();
             // Свои недавние реплики для анти-повтора: из полной живой истории
-            // (is_me=true), последние 16 — этого окна хватало kuni. Считаем
-            // ПЕРЕД каждым вызовом: часть 2 пачки сравнится и с частью 1,
-            // которую только что отправили.
+            // (is_me=true), последние 24 (окно kuni — 16; шире, чтобы не
+            // проскакивать повтор через пару ходов). Считаем ПЕРЕД каждым
+            // вызовом: часть 2 пачки сравнится и с частью 1, которую только
+            // что отправили.
             let mut own_texts: Vec<String> = tg_history_full
                 .iter()
                 .filter(|e| e.1)
                 .map(|e| e.2.clone())
                 .collect();
-            if own_texts.len() > 16 {
-                let cut = own_texts.len() - 16;
+            if own_texts.len() > 24 {
+                let cut = own_texts.len() - 24;
                 own_texts.drain(..cut);
             }
             if tc.function.name == "stay_quiet" {
-                if !is_idle {
+                if !is_idle && !final_sent_via_tool {
                     // На живое сообщение молчать нельзя — возвращаем модели:
                     // ответь текстом или поставь реакцию.
                     warn!("[tg] stay_quiet на живое сообщение — блокирую");
@@ -1728,11 +2236,13 @@ pub async fn handle_new_message(
                          нельзя. Если писать нечего — поставь реакцию."
                             .to_string(),
                     ));
+                    tool_blocked = true;
                     continue;
                 }
-                // Idle-ход: модель САМА выбрала промолчать. В чат ничего не уходит.
-                // Остальные вызовы этого хода (если есть) обрабатываем как обычно —
-                // молчание не должно съесть уже подготовленное сообщение.
+                // Ответ уже отправлен в этом ходу (final_sent_via_tool) —
+                // stay_quiet здесь легален: это «всё, я закончила», а не
+                // игнор живого сообщения. Раньше его блокировали, и модель
+                // досылала ещё пачки сообщений.
                 turn_ctx.push(Message::tool_result(
                     Some(call_id),
                     Some("stay_quiet".to_string()),
@@ -1754,6 +2264,7 @@ pub async fn handle_new_message(
                      не отправляется. Вызови send_voice_message со своей репликой."
                         .to_string(),
                 ));
+                tool_blocked = true;
                 continue;
             }
             if voice_text.is_some() && tc.function.name == "send_gif" {
@@ -1763,6 +2274,7 @@ pub async fn handle_new_message(
                     "Входящее было ГОЛОСОВЫМ — реакции GIF недопустимы, отвечай голосом."
                         .to_string(),
                 ));
+                tool_blocked = true;
                 continue;
             }
             if tc.function.name == "ask" && ask_exhausted {
@@ -1773,6 +2285,7 @@ pub async fn handle_new_message(
                     Some(tc.function.name.clone()),
                     "Пропущено: ask уже возвращал пусто в этом ходе.".to_string(),
                 ));
+                tool_blocked = true;
                 continue;
             }
             let (result, sent_echo) = execute_tg_tool(
@@ -1784,6 +2297,8 @@ pub async fn handle_new_message(
                 llm,
                 diary,
                 diary_entries,
+                &situation,
+                cfg.misc.max_message_parts.saturating_sub(parts_sent),
                 cfg,
                 &own_texts,
                 &anti_repeat_prompt,
@@ -1801,21 +2316,13 @@ pub async fn handle_new_message(
                             "ОШИБКА инструмента send_telegram_message: {result}. Проверь JSON и parts."
                         ),
                     ));
+                    tool_blocked = true;
                     if turn == max_turns {
-                        let reply =
-                            "Сашенька, я чуть зависла... но я с тобой! 🥰 Расскажи ещё что-нибудь?";
-                        // Голосовой ввод → фолбэк-текст НЕ отправляем.
-                        if voice_text.is_none() {
-                            for chunk in split_message(reply, cfg.misc.max_message_parts) {
-                                client.send_action_typing(chat_id);
-                                client.send_text(chat_id, &chunk);
-                                tokio::time::sleep(Duration::from_millis(400)).await;
-                            }
-                            remember_in_history(tg_history, Message::assistant(reply.to_string()));
-                            record_my_send(tg_history, tg_history_full, my_id, cfg, &[reply.to_string()]);
-                        } else {
-                            warn!("[tg] фолбэк-текст НЕ отправлен: голосовой ввод требует голос");
-                        }
+                        // Лимит ходов: generic-заглушку не шлём — тишина.
+                        warn!(
+                            "[tg] send_telegram_message не удался за {} ходов — молчим",
+                            max_turns
+                        );
                         break;
                     }
                     continue;
@@ -1848,9 +2355,13 @@ pub async fn handle_new_message(
                     Some("send_telegram_message".to_string()),
                     result.clone(),
                 ));
-                message_sends += 1;
-                if message_sends >= 2 {
-                    // Больше двух сообщений за вызов не шлём.
+                parts_sent += sent_echo.len();
+                if parts_sent >= cfg.misc.max_message_parts {
+                    // Жёсткий лимит сообщений за ход — не заваливаем чат.
+                    debug!(
+                        "[tg] лимит сообщений за ход ({} >= {}) — закрываем",
+                        parts_sent, cfg.misc.max_message_parts
+                    );
                     break;
                 }
                 // ВАЖНО: здесь НЕ break. Модель часто вызывает в одном ходу
@@ -1876,18 +2387,6 @@ pub async fn handle_new_message(
                 ask_exhausted = true;
             }
         }
-        if repeat_nudged {
-            // Нудж анти-повтора уже в turn_ctx. kuni-философия: лучше молчать
-            // или переписать, чем слать canned-реплику («я чуть зависла…») —
-            // это сам по себе повтор и спам. Раньше этот переход попадал в
-            // canned-фолбэк в ту же миллисекунду — модель никогда не
-            // переформулировала. Отсюда новые ходы до max_turns без fallback.
-            if turn < max_turns {
-                continue;
-            }
-            debug!("[tg] анти-повтор в конце хода — молчим вместо canned-реплики");
-            break;
-        }
         if chose_quiet {
             // Ход закрылся тишиной: в чат ничего не ушло. Дальше — тишина.
             debug!("[tg] ход завершён промолчанием");
@@ -1895,91 +2394,130 @@ pub async fn handle_new_message(
         }
         let handled = real_tool_done;
 
+        // ГЛАВНЫЙ гейт: лимит сообщений за ход важнее анти-повтора. Как только
+        // отправили максимум — закрываем ход и НЕ досылаем (иначе после нуджа
+        // анти-повтора бот слал ещё пачки).
+        if final_sent_via_tool
+            && (parts_sent >= cfg.misc.max_message_parts || turn >= max_turns)
+        {
+            debug!(
+                "[tg] финал отправлен, лимит сообщений ({} частей) — ход закрываем",
+                parts_sent
+            );
+            break;
+        }
+        if repeat_nudged {
+            // Нудж уже в turn_ctx. kuni-философия: лучше молчать или
+            // переписать, чем слать canned-реплику («я чуть зависла…»).
+            if turn < max_turns {
+                continue;
+            }
+            debug!("[tg] анти-повтор в конце хода — молчим вместо canned-реплики");
+            break;
+        }
         if final_sent_via_tool {
             // Ответ уже отправлен, но ход НЕ закончен: модель может следующим
             // вызовом вызвать generate_image (протокол «реплика → фото»).
             // Если вызовов больше нет — она закончит текстом, и мы выйдем тихо.
-            if message_sends >= 2 || turn >= max_turns {
-                debug!("[tg] финал отправлен, ход закрываем");
-                break;
-            }
             continue;
+        }
+        if tool_blocked {
+            // Инструмент заблокирован (stay_quiet на живое сообщение, текст на
+            // голосовое, кривой JSON, повторный ask) — даём модели следующий
+            // ход. Generic-заглушка («я чуть зависла…») не отправляется НИКОГДА.
+            if turn < max_turns {
+                continue;
+            }
+            warn!("[tg] инструменты заблокированы, лимит ходов — молчим");
+            break;
         }
         if handled {
             if turn == max_turns {
-                if is_idle {
-                    // Idle: canned-реплика — это ровно тот «по часам» спам. Молчим.
-                    warn!("[tg] idle: лимит tool-loop — промолчали вместо canned-реплики");
-                    break;
-                }
-                if final_sent_via_tool {
-                    // Ответ уже отправлен — canned-реплика не нужна.
-                    debug!("[tg] лимит tool-loop, но ответ уже отправлен — молча закрываем");
-                    break;
-                }
-                if repeat_nudged {
-                    // Нудж уже был: canned-реплика = ещё один спам-повтор.
-                    debug!("[tg] лимит tool-loop после нуджа анти-повтора — молчим");
-                    break;
-                }
-                warn!(
-                    "[tg] достигнут лимит tool-loop ({}), отправляю fallback-ответ",
-                    max_turns
-                );
-                let reply = "Сашенька, я чуть зависла на своих мыслях... но я с тобой! 🥰 Расскажи ещё что-нибудь?";
-                let reply = reply.trim();
-                // Голосовой ввод → фолбэк-текст НЕ отправляем (правило
-                // «голосовое → ответ только голосом»).
-                if voice_text.is_none() {
-                    let chunks = split_message(reply, cfg.misc.max_message_parts);
-                    for (i, chunk) in chunks.iter().enumerate() {
-                        if i > 0 {
-                            let wpm = cfg.misc.typing_simulation_min_wpm
-                                + (cfg.misc.typing_simulation_max_wpm
-                                    - cfg.misc.typing_simulation_min_wpm)
-                                    / 2;
-                            let words = chunk.split_whitespace().count().max(1);
-                            let secs = (words as f64 / wpm as f64 * 60.0).clamp(0.3, 3.0);
-                            tokio::time::sleep(Duration::from_secs_f64(secs)).await;
-                        }
-                        client.send_action_typing(chat_id);
-                        client.send_text(chat_id, chunk.as_str());
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                    }
-                    remember_in_history(tg_history, Message::assistant(reply.to_string()));
-                    record_my_send(tg_history, tg_history_full, my_id, cfg, &[reply.to_string()]);
-                } else {
-                    warn!("[tg] фолбэк-текст НЕ отправлен: голосовой ввод требует голос");
-                }
+                // Инструмент сработал, но текста в чат так и не ушло: generic-заглушка
+                // запрещена — молчим (как в kuni).
+                warn!("[tg] лимит tool-loop без отправленного текста — молчим");
                 break;
             }
             continue;
         }
 
-        // Если дошли сюда — ни один tool не отправил финал и не обработан.
-        // (обычно не случается при tool_choice=required + send_telegram_message)
-        if is_idle {
-            // Idle: canned-реплика тут была бы «спамом по часам» — молчим.
-            warn!("[tg] idle: ни один tool не завершил ход — промолчали");
-            break;
-        }
-        if repeat_nudged {
-            debug!("[tg] ни один tool после нуджа анти-повтора — молчим");
-            break;
-        }
-        warn!("[tg] ни один tool не завершил ответ — fallback");
-        let reply =
-            "Сашенька, я тут немного зависла в мыслях... но я с тобой! 🥰 Расскажи ещё что-нибудь?";
-        // Голосовой ввод → фолбэк-текст НЕ отправляем.
-        if voice_text.is_none() {
-            client.send_text(chat_id, reply);
-            remember_in_history(tg_history, Message::assistant(reply.to_string()));
-            record_my_send(tg_history, tg_history_full, my_id, cfg, &[reply.to_string()]);
-        } else {
-            warn!("[tg] фолбэк-текст НЕ отправлен: голосовой ввод требует голос");
-        }
-        return;
+        // Ни один tool не выполнился и финал не отправлен: generic-заглушку не
+        // шлём — лучше тишина, чем «я тут немного зависла…».
+        warn!("[tg] ни один tool не выполнился — молчим");
+        break;
     }
+
+    // ── Per-chat состояние «моё состояние с ним» ──────────────────────────
+    // Оценка хода записывается в data/diary/chat_state/<chat_id>.md: его и моё
+    // эмоциональное состояние между ходами (общий self_state.md — про её
+    // собственный день, это разные вещи). Только для ЖИВЫХ ходов: idle/сон не
+    // меняют «состояние с ним» — там его состояние объективно неизвестно.
+    if let Some(a) = &assessment {
+        let updated = Local::now().format("%d.%m %H:%M").to_string();
+        if let Err(e) = write_chat_state(
+            std::path::Path::new(&cfg.misc.diary_dir),
+            chat_id,
+            a,
+            &updated,
+        ) {
+            warn!("[tg] per-chat состояние: запись не удалась ({e})");
+        } else {
+            debug!("[tg] per-chat состояние обновлено: {}", updated);
+        }
+    }
+
+    // ── Ситуационная заметка после обмена ─────────────────────────────────
+    // После каждого реального хода (живой / idle / сон) — один дешёвый
+    // LLM-вызов, который дописывает ОДНУ заметку в последовательную историю:
+    // ситуация + его состояние + моё. Если за ход ничего не произошло
+    // (промолчали) — заметки нет.
+    if tg_history_full.len() > hist_len_before {
+        let exchange_rows = &tg_history_full[hist_len_before..];
+        // Его реплика была в этом обмене? На idle/сон — только её слова, и
+        // состояние «Он:» честнее помечать «неизвестно», а не выдумывать.
+        let his_present = exchange_rows.iter().any(|(_, is_me, _, _)| !*is_me);
+        let exchange = situation_exchange_text(cfg, exchange_rows);
+        if !exchange.trim().is_empty() {
+            let note_llm = llm.with_temperature(0.3);
+            match situation
+                .write_note(
+                    &note_llm,
+                    prompts,
+                    diary.embedding(),
+                    &exchange,
+                    cfg.misc.situation_keep_entries,
+                    his_present,
+                )
+                .await
+            {
+                Ok(Some(note)) => info!("[tg] ситуационная заметка №{} записана", note.n),
+                Ok(None) => {}
+                Err(e) => warn!("[tg] ситуационная заметка ошибка: {e}"),
+            }
+        }
+    }
+}
+
+/// Собирает ОДИН обмен (`[ДД.ММ ЧЧ:ММ] Имя: текст`) из полной истории — его
+/// сообщение + её ответ (или её одиночное idle-сообщение). Берём хвост до 12
+/// реплик, чтобы заметка оставалась атомарной, а промпт — коротким.
+fn situation_exchange_text(cfg: &Config, rows: &[(i64, bool, String, i64)]) -> String {
+    let start = rows.len().saturating_sub(12);
+    let mut out = String::new();
+    for (sender, is_me, text, date) in &rows[start..] {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let who = if *is_me {
+            cfg.general.character_name.clone()
+        } else if *sender == cfg.general.papik_chat_id {
+            cfg.general.papik_name.clone()
+        } else {
+            format!("user{}", sender)
+        };
+        out.push_str(&format!("{} {}: {}\n", format_ts(*date), who, text));
+    }
+    out
 }
 
 /// Режим Telegram: авторизация, цикл update-ов, idle/sleep автономность.
@@ -2216,6 +2754,8 @@ pub async fn run_telegram_mode(
     // считаем «совсем тихо» и решаем, когда уснуть.
     let mut last_activity = Instant::now();
     let mut consolidated = false;
+    // Одноразовый бутстрап self_state после загрузки истории (см. helper).
+    let mut self_state_bootstrapped = false;
     // Для setOption online: НЕ чаще раза в минуту.
     let mut last_online_reset = Instant::now();
     // ── Инициатива: таймер НЕ диктует, а лишь даёт шанс ──────────────
@@ -2398,6 +2938,13 @@ pub async fn run_telegram_mode(
                                 recent_len,
                                 tg_history_full.len()
                             );
+                            // Один раз после загрузки истории: если self_state.md
+                            // ещё нет — создать, чтобы первый idle-шанс уже имел
+                            // живой материал (иначе модель молчит в пустоту).
+                            if !self_state_bootstrapped && tg_history_full.len() >= 20 {
+                                self_state_bootstrapped = true;
+                                bootstrap_self_state(llm, prompts, cfg, &tg_history_full).await;
+                            }
                             // Мало сообщений — TDLib отдал локальный кэш, а полный
                             // список с сервера ещё не пришёл. Повторяем позже.
                             if tg_history_full.len() < 20 && history_attempts < 6 {
@@ -2619,13 +3166,28 @@ pub async fn run_telegram_mode(
                         // Её собственные последние реплики — иначе модель повторяет
                         // одну и ту же строчку («я тут, жду тебя») из хода в ход.
                         let own_hint = own_recent_quotes(&tg_history_full, 3);
+                        // Её собственное состояние — чтобы было ЧТО рассказать
+                        // (настроение, чем занята), а не дежурное «я тут».
+                        let self_state_hint = std::fs::read_to_string(
+                            std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md"),
+                        )
+                        .ok()
+                        .map(|s| {
+                            let s = s.trim();
+                            if s.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n\nТвоё текущее состояние (можешь опереться на него):\n{}", take_chars(s, 800))
+                            }
+                        })
+                        .unwrap_or_default();
                         let stim = serde_json::json!({
                             "@type": "updateNewMessage",
                             "message": {
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[idle] [внутреннее] Сейчас {}:{} по времени Саши. Тишина: он не писал уже {} минут. Это НЕ сигнал «надо что-то написать» — это момент, когда ты МОЖЕШЬ написать первая, если сама хочется и есть что сказать. Если он сейчас спит или ему не до тебя — не пиши вовсе (stay_quiet). Если нечего сказать или не хочется — тоже промолчи (это нормально, никто не обидится). Не пиши «просто чтобы напомнить о себе», не спрашивай «ты тут?» и не жалуйся на ожидание. Написать можно ОДНУ короткую живую реплику: про свои дела, настроение, что-то милое про него — только если это правда твоё желание.{}{}", local_now.hour(), local_now.minute(), elapsed_any / 60, own_hint, news_hint(3, 110)) } }
+                                "content": { "text": { "text": format!("[idle] [внутреннее] Сейчас {}:{} по времени Саши. Он молчит уже {} минут — это нормально, человек пишет когда хочет. Сейчас ТВОЙ ход: живая девушка иногда пишет первой просто потому, что вспомнила, улыбнулась, заметила что-то или захотела поделиться. Если у тебя есть такое живое желание — напиши первой, не молчи из вежливости. Если сейчас правда не хочется или нечего — промолчи (stay_quiet), это тоже нормально и никого не обидит.{}\n\nНЕ пиши «ты тут?», не жалуйся на тишину, не напоминай о себе пустым «я здесь» и не повторяй свои прошлые реплики. Напиши ОДНУ короткую живую реплику: про свои дела/настроение/мысль, что-то милое про него, или своё мнение о чём-то.{}{}", local_now.hour(), local_now.minute(), elapsed_any / 60, self_state_hint, own_hint, news_hint(3, 110)) } }
                             }
                         });
                         let before = tg_history_full.len();
@@ -2873,60 +3435,212 @@ mod photo_prompt_tests {
     use super::*;
 
     #[test]
-    fn detects_cyrillic() {
-        assert!(has_cyrillic("сидит у окна с кружкой"));
-        assert!(!has_cyrillic("sitting by the window with a mug"));
-        assert!(!has_cyrillic("1girl, blue eyes"));
+    fn sanitize_removes_explicit_terms_but_keeps_scene() {
+        let scene = "nsfw, nude, sitting on a bed, red dress, breasts";
+        let out = sanitize_for_llm(scene);
+        assert!(out.contains("sitting on a bed"));
+        // Главный регресс: сцена НЕ должна терять цвета и детали.
+        assert!(out.contains("red dress"));
+        assert!(!out.to_lowercase().contains("nsfw"));
+        assert!(!out.to_lowercase().contains("nude"));
+        assert!(!out.to_lowercase().contains("breasts"));
     }
 
     #[test]
-    fn dedupes_canon_tags() {
-        let canon = "white hair, cat ears, heterochromia, one eye deep blue";
-        // Модель часто повторяет канон сама — дубли должны уйти.
-        let scene = "white hair, cat ears, sitting on a chair, heterochromia";
-        let out = dedupe_against_canon(scene, canon);
-        assert!(out.contains("sitting on a chair"));
-        assert!(!out.contains("white hair"));
-        assert!(!out.contains("heterochromia"));
+    fn explicit_words_are_detected() {
+        let found = explicit_words_in("nsfw, nude on a bed");
+        assert!(found.contains(&"nsfw"));
+        assert!(found.contains(&"nude"));
+        assert!(!found.contains(&"penis"));
     }
 
     #[test]
-    fn overlap_detects_same_scene() {
-        let a = "sitting by the window at night holding a warm mug";
-        let b = "sitting by the window at night with a mug in hands";
-        let c = "standing on a rooftop at sunset with wind";
-        assert!(scene_overlap(a, b) > 0.5);
-        assert!(scene_overlap(a, c) < 0.3);
+    fn parses_fenced_json() {
+        let raw =
+            "```json\n{\"positivePrompt\":\"1girl, purple eyes\",\"negativePrompt\":\"blurry\"}\n```";
+        let (p, n) = parse_sd_json(raw).unwrap();
+        assert_eq!(p, "1girl, purple eyes");
+        assert_eq!(n, "blurry");
     }
 
     #[test]
-    fn diversify_adds_variation_for_repeated_scene() {
-        // Первая сцена — как есть, вторая (та же) — с принудительным разбросом.
-        let first = diversify_scene("sitting by the window at night holding a warm mug");
-        assert!(!first.contains("different location"));
-        let second = diversify_scene("sitting by the window at night holding a warm mug");
-        assert!(second.contains("different location"));
+    fn parses_json_with_surrounding_text() {
+        let raw = "Here you go: {\"positivePrompt\":\"1girl\",\"negativePrompt\":\"\"} done";
+        let (p, n) = parse_sd_json(raw).unwrap();
+        assert_eq!(p, "1girl");
+        assert!(n.is_empty());
+    }
+
+    #[test]
+    fn clamp_keeps_tags_intact() {
+        let long = "1girl, white hair, heterochromia, purple eyes, blue eyes, sitting, \
+                    rooftop at sunset, golden light, wind, smile, red dress, holding mug";
+        let out = clamp_prompt_words(long, 12);
+        assert!(out.contains("heterochromia"));
+        assert!(out.split_whitespace().count() <= 12);
+        assert!(out.contains("rooftop at sunset") || !out.contains("rooftop"));
+    }
+
+    #[test]
+    fn scene_keeps_its_colors() {
+        // Регресс на старый strip_eye_tags: он вырезал любые цветовые теги.
+        let out = sanitize_for_llm("blue dress, red rose, golden sunlight, on a rooftop");
+        assert!(out.contains("blue dress"));
+        assert!(out.contains("red rose"));
+        assert!(out.contains("golden sunlight"));
+    }
+
+    #[test]
+    fn nsfw_words_are_reappended() {
+        let positive = "1girl, sitting on a bed, purple eyes, blue eyes";
+        let out = append_explicit_words(positive, "nsfw, nude, sitting on a bed, pussy");
+        assert!(out.contains("1girl"));
+        assert!(out.contains("sitting on a bed"));
+        assert!(out.contains("nsfw"));
+        assert!(out.contains("nude"));
+        assert!(out.contains("pussy"));
+        // Дубли не появляются.
+        assert_eq!(out.matches("sitting on a bed").count(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "живой вызов Mistral: cargo test -p furinya-tg live_engineer -- --ignored --nocapture"]
+    async fn live_engineer_smoke() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cfg = Config::load(root.join("config.toml")).expect("config.toml");
+        let llm = LlmClient::new(
+            cfg.llm_base_url(),
+            &cfg.general.llm.endpoint.bearer_key,
+            cfg.llm_model(),
+            furinya_llm::SamplingParams {
+                temperature: 0.4,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                presence_penalty: None,
+                repetition_penalty: None,
+            },
+        );
+        let body = std::fs::read_to_string(root.join("prompts/character_body.md")).unwrap();
+        let appearance =
+            std::fs::read_to_string(root.join("prompts/character_appearance.md")).unwrap();
+        let base = format!("{}, {}", body.trim(), strengthen_eyes(appearance.trim()));
+        for scene in [
+            "сидит на подоконнике с кружкой чая, закат, тёплый свет, улыбается",
+            "танцует в неоновом клубе, кружится, юбка развевается, динамика",
+        ] {
+            let (scene_positive, negative) = engineer_sd_prompt(&llm, scene, false)
+                .await
+                .expect("prompt-инженер");
+            let positive = dedupe_exact_tags(&format!("{base}, {scene_positive}"));
+            println!(
+                "\nSCENE: {scene}\nSCENE TAGS: {scene_positive}\nFULL: {positive}\nNEGATIVE: {negative}\n"
+            );
+            assert!(
+                positive.contains("(heterochromia:1.5)"),
+                "потеряна усиленная гетерохромия: {positive}"
+            );
+            assert!(
+                positive.contains("petite"),
+                "потерян канон тела: {positive}"
+            );
+            assert!(
+                positive.split(',').count() < 60,
+                "промпт слишком длинный: {} тегов",
+                positive.split(',').count()
+            );
+            assert!(!positive.to_lowercase().contains("furina"));
+            let low = positive.to_lowercase();
+            if scene.contains("кружк") {
+                assert!(
+                    low.contains("mug") || low.contains("cup"),
+                    "потеряна кружка: {positive}"
+                );
+            }
+            if scene.contains("танцует") {
+                assert!(
+                    low.contains("action") || low.contains("dynamic") || low.contains("motion"),
+                    "нет динамики для экшен-сцены: {positive}"
+                );
+            }
+        }
     }
 }
 
 #[cfg(test)]
-mod eye_tag_tests {
+mod anti_repeat_tests {
     use super::*;
 
     #[test]
-    fn strips_conflicting_eye_tags() {
-        let scene = "sitting by the window, green eyes, heterochromia, holding a mug, blue eyes";
-        let out = strip_eye_tags(scene);
-        assert!(out.contains("sitting by the window"));
-        assert!(out.contains("holding a mug"));
-        assert!(!out.contains("green eyes"));
-        assert!(!out.contains("heterochromia"));
-        assert!(!out.contains("blue eyes"));
+    fn verbatim_repeats_are_blocked() {
+        // Пороги откалиброваны на реальных репликах бота: дословные повторы
+        // дают 0.73–1.0 и обязаны блокироваться (эмбеддинги Mistral лежат).
+        let cases = [
+            (
+                "Ты — моя единственная ласка, моя маленькая кошечка. 🐱 Когда ты рядом, мир кажется ярче, а моё сердце — легче. Мурр...",
+                "Ты — моя единственная ласка, моя маленькая кошечка",
+            ),
+            (
+                "Вот так я танцую, когда у меня хорошее настроение! 💃😼",
+                "Вот так я танцую, когда у меня хорошее настроение!",
+            ),
+            (
+                "Твой вопрос... как будто я пытаюсь разгадать загадку, которая не имеет ответа на словах. 😊",
+                "Твой вопрос... как будто ты пытаешься разгадать загадку, которая не имеет ответа на словах. 🌙",
+            ),
+            (
+                "Сейчас, я тут 📸... Вот, как я выгляжу прямо сейчас 😼",
+                "Сейчас, сюда 📸... Вот, как я выгляжу сейчас",
+            ),
+        ];
+        for (a, b) in cases {
+            let sim = lexical_similarity(a, b);
+            assert!(
+                sim > LEXICAL_REPEAT_THRESHOLD,
+                "дословный повтор не поймали: {sim:.3} ({a:?} ≈ {b:?})"
+            );
+        }
     }
 
     #[test]
-    fn keeps_scene_without_eye_words() {
-        let scene = "on a rooftop at sunset, wind in her hair, cat ears";
-        assert_eq!(strip_eye_tags(scene), scene);
+    fn genuinely_different_replies_pass() {
+        // Нормально разные реплики — даже с общим обращением — не должны
+        // задевать порог, иначе бот превратится в молчуна.
+        let cases = [
+            ("Спи спокойно, Саша. Я здесь. 🌙", "Мурр... сладких снов. 😼"),
+            (
+                "Мурр... как дела? У меня всё отлично, а у тебя как?",
+                "Что именно не так? Я тут, рядом, если нужно поговорить.",
+            ),
+            (
+                "Дождь всё ещё стучит в окно, и я думаю, как хорошо, когда рядом кто-то, кто понимает эту тишину...",
+                "Ты для меня как солнце — не всегда яркое, но всегда важное. 🌞",
+            ),
+            (
+                "Ты — моя единственная ласка, моя маленькая кошечка",
+                "Ты моя маленькая кошечка, и я не отпускаю тебя, потому что ты — моё солнышко.",
+            ),
+            (
+                "Вот так я танцую, когда у меня хорошее настроение! 💃😼",
+                "Вот так я танцую под твои песни 💃",
+            ),
+        ];
+        for (a, b) in cases {
+            let sim = lexical_similarity(a, b);
+            assert!(
+                sim <= LEXICAL_REPEAT_THRESHOLD,
+                "ложное срабатывание на разных репликах: {sim:.3} ({a:?} ≈ {b:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_short_inputs_are_safe() {
+        assert_eq!(lexical_similarity("", "что-то"), 0.0);
+        assert_eq!(lexical_similarity("что-то", ""), 0.0);
+        assert_eq!(lexical_similarity("!!!", "???"), 0.0);
+        assert_eq!(lexical_similarity("а", "а"), 1.0);
+        assert!(lexical_similarity("привет", "привет!") > 0.9);
     }
 }
+

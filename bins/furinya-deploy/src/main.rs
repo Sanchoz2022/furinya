@@ -375,8 +375,9 @@ fn build_payload(a: &Args, stage: &Path) -> Result<()> {
 
     // 6) .env с ключами (значения не печатаются)
     let env = format!(
-        "MISTRAL_API_KEY={}\nGROQ_API_KEY={}\nFISH_API_KEY={}\nFURINYA_HORDE_KEY={}\nSD_API_URL={}\nFURINYA_TG_PROXY=socks5://127.0.0.1:7890\nFURINYA_WEB_PROXY=socks5h://127.0.0.1:7890\nHTTPS_PROXY=socks5h://127.0.0.1:7890\nHTTP_PROXY=socks5h://127.0.0.1:7890\nNO_PROXY=api.mistral.ai,192.168.1.172,127.0.0.1,localhost\nFURINYA_TD_QUIET=1\n",
+        "MISTRAL_API_KEY={}\nGEMINI_API_KEY={}\nGROQ_API_KEY={}\nFISH_API_KEY={}\nFURINYA_HORDE_KEY={}\nSD_API_URL={}\nFURINYA_TG_PROXY=socks5://127.0.0.1:7890\nFURINYA_WEB_PROXY=socks5h://127.0.0.1:7890\nHTTPS_PROXY=socks5h://127.0.0.1:7890\nHTTP_PROXY=socks5h://127.0.0.1:7890\nNO_PROXY=api.mistral.ai,192.168.1.172,127.0.0.1,localhost\nFURINYA_TD_QUIET=1\n",
         std::env::var("MISTRAL_API_KEY").unwrap_or_default(),
+        std::env::var("GEMINI_API_KEY").unwrap_or_default(),
         std::env::var("GROQ_API_KEY").unwrap_or_default(),
         std::env::var("FISH_API_KEY").unwrap_or_default(),
         std::env::var("FURINYA_HORDE_KEY").unwrap_or_default(),

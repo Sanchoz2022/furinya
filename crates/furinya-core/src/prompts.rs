@@ -147,6 +147,30 @@ impl Prompts {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// Промпт обновления «своего состояния» (inner state) — отдельный файл
+    /// self_state.md, который держит её собственное настроение/занятия.
+    pub fn self_state(&self) -> String {
+        self.extra
+            .get("self_state")
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Промпт ситуационной заметки (situation.md) — атомарная последовательная
+    /// история «что происходит между нами прямо сейчас».
+    pub fn situation(&self) -> String {
+        self.extra
+            .get("situation")
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Промпт внутренней оценки хода (assess.md) — «размышление» перед ответом:
+    /// состояние его, своё состояние и план реплики.
+    pub fn assess(&self) -> String {
+        self.extra.get("assess").cloned().unwrap_or_default()
+    }
 }
 
 /// Вырезает YAML front-matter в начале файла (блок между первым и вторым `---`).

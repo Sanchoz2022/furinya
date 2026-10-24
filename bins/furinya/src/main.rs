@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
     let mut history: Vec<Message> = vec![Message::system(system_prompt.clone())];
 
     let emb_client = EmbeddingClient::from_config(&cfg.general.embedding.endpoint);
+    let embed_identity = emb_client.identity();
     let diary = Diary::new(
         &cfg.misc.diary_dir,
         emb_client,
@@ -85,6 +86,8 @@ async fn main() -> Result<()> {
         cfg.misc.diary_plagiarism_threshold,
         cfg.misc.diary_min_relatedness,
     );
+
+    migrate_embeddings_if_needed(&cfg, &diary, &mut diary_entries, &embed_identity).await;
 
     if cfg.general.telegram_enabled && std::env::var("FURINYA_CONSOLE").is_err() {
         info!("[furinya] telegram_enabled=true — запуск TDLib режима");
@@ -467,4 +470,47 @@ fn print_memory(entries: &[furinya_diary::Entry], tags: &[String]) {
         println!("{}", e.body);
     }
     println!("\n════════════════════════════════════════════════════════");
+}
+
+/// Пересчёт векторной памяти при смене модели эмбеддингов.
+///
+/// Старые векторы (напр. Mistral) лежат в другом пространстве, чем новые
+/// (локальный bge-m3), даже при совпадении размерности — cosine даёт мусор.
+/// Сравниваем идентификатор эмбеддера (`baseUrl|model`) с маркером
+/// `data/diary/.embed_model`; при расхождении пересчитываем дневник и
+/// ситуационный индекс папика и только затем пишем маркер. Если эмбеддер
+/// недоступен — маркер не пишем, пересчёт повторится на следующем старте.
+async fn migrate_embeddings_if_needed(
+    cfg: &Config,
+    diary: &Diary,
+    entries: &mut [furinya_diary::Entry],
+    identity: &str,
+) {
+    let marker = std::path::Path::new(&cfg.misc.diary_dir).join(".embed_model");
+    let prev = std::fs::read_to_string(&marker)
+        .ok()
+        .map(|s| s.trim().to_string());
+    if prev.as_deref() == Some(identity) {
+        return;
+    }
+    info!(
+        "[furinya] смена эмбеддера: {} -> {} — пересчитываю память",
+        prev.as_deref().unwrap_or("<нет>"),
+        identity
+    );
+    match diary.reembed_all(entries).await {
+        Ok(n) => {
+            info!("[furinya] дневник: пересчитано {} эмбеддингов", n);
+            let sit =
+                furinya_diary::SituationStore::new(&cfg.misc.diary_dir, cfg.general.papik_chat_id);
+            match sit.reindex(diary.embedding()).await {
+                Ok(m) => info!("[furinya] ситуация: пересчитано {} эмбеддингов", m),
+                Err(e) => warn!("[furinya] ситуация: пересчёт не удался: {e:#}"),
+            }
+            let _ = std::fs::write(&marker, identity);
+        }
+        Err(e) => warn!(
+            "[furinya] пересчёт дневника не удался ({e:#}) — маркер не пишу, повтор на следующем старте"
+        ),
+    }
 }

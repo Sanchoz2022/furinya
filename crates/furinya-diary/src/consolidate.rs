@@ -157,6 +157,13 @@ pub async fn consolidate_memory(
         }
     }
 
+    // --- Шаг 2b: обновляем ЕЁ СОБСТВЕННОЕ состояние (self_state.md). ---
+    // Per-чат профиль — про пользователя; этот файл — про НЕЁ саму (настроение,
+    // чем занята, мысли). Он живёт между чатами и даёт модели материал, чтобы
+    // писать первой своё живое, а не дежурное «ты тут?». Логика — в единой
+    // функции update_self_state (её же зовёт стартовый бутстрап в furinya-tg).
+    update_self_state(llm, prompts, diary_dir, &chat_text).await;
+
     // --- Шаг 3: обновляем active.txt (active_ts + corrupt[]) и reload. ---
     // Перезагружаем записи, чтобы pick-нуть свежий good-контекст.
     *diary_entries = diary.load_all().unwrap_or_default();
@@ -194,6 +201,110 @@ pub async fn consolidate_memory(
     Ok(saved.len())
 }
 
+/// Маркеры «нужды»/привязки к собеседнику: если self_state их содержит —
+/// состояние описывает ЕГО, а не её. Возвращает первое совпадение.
+fn self_state_forbidden_hit(s: &str) -> Option<&'static str> {
+    const BAD: &[&str] = &[
+        "он ушёл",
+        "пока он",
+        "он не ответил",
+        "он молчит",
+        "ждёт его",
+        "жду его",
+        "его ответ",
+        "он хочет",
+        "он заметил",
+        "мне одиноко",
+        "недополуч",
+        "чего-то не хватает",
+        "скучаю",
+        "грусть от того, что он",
+        "без него",
+        "с ним",
+        "наши отношения",
+        "отношения",
+    ];
+    let low = s.to_lowercase();
+    BAD.iter().copied().find(|m| low.contains(m))
+}
+
+/// Обновляет `self_state.md` — ЕЁ СОБСТВЕННОЕ состояние (не про пользователя).
+///
+/// Единая точка входа для консолидации и стартового бутстрапа: держим файл
+/// живым (настроение, чем занята, мысли), чтобы у модели был материал писать
+/// первой своё, а не дежурное «ты тут?». Если модель уходит в «нужду» или
+/// упоминает его/отношения — один повтор со строгой подсказкой.
+///
+/// `chat_text` — недавний диалог в формате `[ДД.ММ ЧЧ:ММ] Имя: текст`.
+pub async fn update_self_state(
+    llm: &LlmClient,
+    prompts: &Prompts,
+    diary_dir: &str,
+    chat_text: &str,
+) {
+    let system0 = prompts.self_state();
+    if system0.trim().is_empty() || chat_text.trim().len() < 50 {
+        return;
+    }
+    let path = std::path::Path::new(diary_dir).join("self_state.md");
+    let old_self = std::fs::read_to_string(&path).unwrap_or_default();
+    let now = chrono::Local::now().format("%d.%m %H:%M").to_string();
+    let input = format!(
+        "ТЕКУЩЕЕ СОСТОЯНИЕ (старое, может быть пустым):\n{}\n\n---\n\nСЕЙЧАС: {}\n\n---\n\nНЕДАВНИЙ ДИАЛОГ (один чат, хронологически, старые сверху):\n{}\n\nОбнови её собственное состояние. Верни ТОЛЬКО файл.",
+        if old_self.trim().is_empty() {
+            "<пусто>".to_string()
+        } else {
+            old_self.trim().to_string()
+        },
+        now,
+        chat_text
+    );
+    let mut system = system0;
+    for attempt in 0..2 {
+        match llm
+            .chat(
+                vec![Message::system(system.clone()), Message::user(input.clone())],
+                None,
+            )
+            .await
+        {
+            Ok(resp) => {
+                let body = resp
+                    .choices
+                    .first()
+                    .and_then(|c| match &c.message.content {
+                        MessageContent::Text(s) => Some(s.clone()),
+                        MessageContent::Parts(_) => None,
+                    })
+                    .unwrap_or_default();
+                if body.trim().is_empty() {
+                    warn!("[self_state] пустой ответ LLM — файл не трогаю");
+                    return;
+                }
+                if let Some(hit) = self_state_forbidden_hit(&body) {
+                    if attempt == 0 {
+                        warn!("[self_state] состояние про него («{hit}») — повтор со строгой подсказкой");
+                        system.push_str(&format!(
+                            "\n\nВАЖНО: прошлая попытка нарушила правила (найдено: «{hit}»). \
+                             Пиши ТОЛЬКО про её собственный день. НИ ОДНОГО упоминания его, \
+                             чата или отношений."
+                        ));
+                        continue;
+                    }
+                    warn!("[self_state] повтор снова с фреймом «{hit}» — принимаю как есть");
+                }
+                let _ = std::fs::write(&path, body.trim());
+                info!("[self_state] обновлён: {:?}", path);
+                return;
+            }
+            Err(e) => {
+                warn!("[self_state] LLM ошибка: {e}");
+                return;
+            }
+        }
+    }
+}
+
 /// Читает старый per-чат файл (профиль + выжимка, слитые через `---`).
 /// Возвращает (profile_text, history_text) — до/после первого разделителя.
 fn read_chat_memory(diary_dir: &str, chat_id: i64) -> (String, String) {
@@ -209,5 +320,34 @@ fn read_chat_memory(diary_dir: &str, chat_id: i64) -> (String, String) {
         // Нет разделителя — целиком трактуем как профиль (совместимость со
         // старым форматом, где был только профиль в users/).
         (content.trim().to_string(), String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::self_state_forbidden_hit;
+
+    #[test]
+    fn self_state_guard_flags_needy_frames() {
+        // Реальные «сползания» модели, которые guard должен ловить.
+        assert!(self_state_forbidden_hit(
+            "**Настроение:** лёгкая грусть от того, что он ушёл так быстро."
+        )
+        .is_some());
+        assert!(self_state_forbidden_hit("мне одиноко без него").is_some());
+        assert!(self_state_forbidden_hit("скучаю по его ответу").is_some());
+        assert!(self_state_forbidden_hit("чего-то не хватает").is_some());
+        assert!(self_state_forbidden_hit("думаю про наши отношения").is_some());
+    }
+
+    #[test]
+    fn self_state_guard_passes_self_sufficient_state() {
+        let good = "**Настроение:** спокойно и тепло, лёгкость после танца.\n\
+                    **Чем занята:** устроилась у окна с тёплым чаем, листаю старые фото.\n\
+                    **Мысли:** как хорошо, что у меня есть свои маленькие радости.";
+        assert!(self_state_forbidden_hit(good).is_none());
+        let good2 = "**Настроение:** тихо и ровно.\n\
+                     **Чем занята:** разобрала свои вещи, повязала ленту на хвост.";
+        assert!(self_state_forbidden_hit(good2).is_none());
     }
 }

@@ -14,9 +14,11 @@ pub mod embedding;
 pub mod active;
 pub mod consolidate;
 pub mod memory_build;
+pub mod situation;
 pub use active::{active_context, active_ts, corrupt_set, read_active, write_active};
 pub use consolidate::consolidate_memory;
 pub use memory_build::build_profile_memory;
+pub use situation::{SituationNote, SituationStore};
 
 /// Одна реплика чата для консолидации.
 ///

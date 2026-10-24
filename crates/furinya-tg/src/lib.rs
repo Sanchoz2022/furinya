@@ -12,9 +12,13 @@
 //! - При `Drop` TdClient шлёт спец-команду `None` в канал → worker вызывает
 //!   `td_json_client_destroy` и завершается. Никакого double-free.
 
+pub mod assessment;
 pub mod auth;
 pub mod agent;
 pub mod idle;
+
+#[cfg(test)]
+mod agent_tests;
 
 use libloading::{Library, Symbol};
 use serde_json::Value;
@@ -170,6 +174,24 @@ impl TdClient {
 /// Дефолтный путь к libtdjson (рядом с бинарником в dev-режиме).
 pub fn default_lib_path() -> PathBuf {
     PathBuf::from("libs/libtdjson.so")
+}
+
+#[cfg(test)]
+impl TdClient {
+    /// Тестовый клиент БЕЗ TDLib: команды уходят в канал, который читает тест.
+    /// Нужен, чтобы прогнать полный ход агента офлайн (без Telegram).
+    pub fn test_client() -> (Self, Receiver<Option<String>>) {
+        let (cmd_tx, rx) = channel();
+        (
+            Self {
+                cmd_tx,
+                downloads: Arc::new(Mutex::new(HashMap::new())),
+                pending_queries: Arc::new(Mutex::new(HashMap::new())),
+                pending_edits: Arc::new(Mutex::new(VecDeque::new())),
+            },
+            rx,
+        )
+    }
 }
 
 impl TdClient {

@@ -12,13 +12,29 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::Serialize;
 
 use crate::active::{active_context, corrupt_set, read_active, write_active};
 use crate::embedding::EmbeddingClient;
+
+/// Служебные файлы каталога дневника, которые НЕ являются записями.
+///
+/// `self_state.md` — её собственное состояние (настроение/занятия), пишется
+/// из `consolidate.rs` как обычный текст. Если считать его записью дневника,
+/// `reembed_all()` перезапишет его метаданными с embedding-вектором.
+pub fn is_service_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if name == "self_state.md" {
+        return true;
+    }
+    // `_foo.md`, `.foo.md` — служебные/скрытые файлы.
+    name.starts_with('_') || name.starts_with('.')
+}
 
 /// Метаданные записи дневника (сериализуются в JSON в блоке `---`).
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
@@ -103,6 +119,12 @@ impl Diary {
     }
 
     /// Загружает все записи из каталога.
+    ///
+    /// Служебные файлы каталога (`self_state.md` — её собственное состояние,
+    /// `_*.md`, `.*.md`) НЕ являются записями дневника. Раньше `self_state.md`
+    /// подхватывался как запись, и `reembed_all()` при смене эмбеддера
+    /// перезаписывал его метаданными с embedding-вектором — сырой JSON
+    /// потом попадал прямо в промпт (в idle-стимул, в контекст).
     pub fn load_all(&self) -> anyhow::Result<Vec<Entry>> {
         std::fs::create_dir_all(&self.dir)
             .with_context(|| format!("создание каталога дневника {:?}", self.dir))?;
@@ -110,6 +132,9 @@ impl Diary {
         for entry in std::fs::read_dir(&self.dir)? {
             let path = entry?.path();
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            if is_service_file(&path) {
                 continue;
             }
             let text = std::fs::read_to_string(&path)?;
@@ -159,6 +184,10 @@ impl Diary {
         let meta_json = serde_json::to_string(&entry.metadata)?;
         let content = format!("---\n{}\n---\n{}", meta_json, entry.body);
         let path = self.dir.join(format!("{}.md", entry.id));
+        // Служебные файлы (`self_state.md`) не перезаписываем метаданными.
+        if is_service_file(&path) {
+            return Ok(());
+        }
         std::fs::write(&path, content).with_context(|| format!("запись {}", path.display()))?;
         Ok(())
     }
@@ -216,6 +245,46 @@ impl Diary {
     /// Публичный доступ к эмбеддинг-клиенту (для исполнения #ask).
     pub fn embedding(&self) -> &EmbeddingClient {
         &self.embedding
+    }
+
+    /// Полный пересчёт эмбеддингов всех записей под текущую модель.
+    ///
+    /// Нужен при смене эмбеддера: старые векторы лежат в другом векторном
+    /// пространстве (даже при совпадении размерности) и дают мусорные «хиты».
+    /// Сначала чистим все векторы (несчитанные записи выпадают из RAG, а не
+    /// дают ложных совпадений), затем считаем заново пачками и пишем на диск.
+    /// Ошибка эмбеддинга прерывает процесс — вызывающий не пишет маркер и
+    /// повторит пересчёт на следующем старте.
+    pub async fn reembed_all(&self, entries: &mut [Entry]) -> anyhow::Result<usize> {
+        for e in entries.iter_mut() {
+            if !e.metadata.embedding.is_empty() {
+                e.metadata.embedding = Vec::new();
+                let _ = self.save(e);
+            }
+        }
+        // Небольшая пачка: тела записей длинные, а у облачных провайдеров
+        // считаются токены запроса. Терпеливый клиент на 429 ждёт Retry-After
+        // (у Gemini free-tier это лимит 30k токенов/мин), а пауза между
+        // пачками держит темп ниже лимита, чтобы почти не упираться.
+        const BATCH: usize = 4;
+        let embedder = self.embedding.patient();
+        let mut done = 0usize;
+        let mut i = 0;
+        while i < entries.len() {
+            let end = (i + BATCH).min(entries.len());
+            let texts: Vec<String> = entries[i..end].iter().map(|e| e.body.clone()).collect();
+            let vecs = embedder.embed_batch(&texts).await?;
+            for (e, v) in entries[i..end].iter_mut().zip(vecs) {
+                e.metadata.embedding = v;
+                self.save(e)?;
+                done += 1;
+            }
+            i = end;
+            if i < entries.len() {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+        }
+        Ok(done)
     }
 
     /// Возвращает отсортированные по relatedness (по убыванию) хиты выше порога.
@@ -380,6 +449,9 @@ impl Diary {
                 continue;
             }
             let path = self.dir.join(format!("{}.md", e.id));
+            if is_service_file(&path) {
+                continue;
+            }
             if path.exists() {
                 std::fs::remove_file(&path)
                     .with_context(|| format!("удаление старой записи {}", path.display()))?;
@@ -394,6 +466,9 @@ impl Diary {
     /// при неудачной консолидации для rollback-логики.
     pub fn mark_corrupt(&self, id: &str) -> anyhow::Result<()> {
         let path = self.dir.join(format!("{}.md", id));
+        if is_service_file(&path) {
+            return Ok(());
+        }
         if !path.exists() {
             return Ok(());
         }
@@ -625,6 +700,51 @@ mod tests {
     fn cosine_empty_is_zero() {
         let a: Vec<f32> = vec![];
         assert_eq!(cosine_similarity(&a, &a), 0.0);
+    }
+
+    #[test]
+    fn load_all_skips_service_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "furinya_diary_load_all_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Запись дневника.
+        std::fs::write(
+            dir.join("1792563174.md"),
+            "---\n{\"score\":0.0,\"confidence\":1.0,\"last_used\":\"\",\"usage_count\":0,\"embedding\":[],\"tags\":[],\"corrupt\":false}\n---\nтело записи",
+        )
+        .unwrap();
+        // Служебные файлы — не записи.
+        std::fs::write(dir.join("self_state.md"), "**Настроение:** спокойное").unwrap();
+        std::fs::write(dir.join("_service.md"), "служебное").unwrap();
+        std::fs::write(dir.join("active.txt"), "id:1").unwrap();
+
+        let diary = Diary::new(
+            &dir,
+            EmbeddingClient::from_config(&EndpointConfig::default()),
+            0.97,
+            0.35,
+        );
+        let entries = diary.load_all().unwrap();
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["1792563174"]);
+        assert!(entries[0].body.contains("тело записи"));
+
+        // save() не перезаписывает служебный файл.
+        std::fs::write(dir.join("self_state.md"), "**Настроение:** спокойное").unwrap();
+        diary.save(&Entry {
+            id: "self_state".into(),
+            metadata: EntryMetadata::default(),
+            body: "тело".into(),
+        })
+        .unwrap();
+        let ss = std::fs::read_to_string(dir.join("self_state.md")).unwrap();
+        assert!(ss.contains("**Настроение:** спокойное"));
+        assert!(!ss.contains("---"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
