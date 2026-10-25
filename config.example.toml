@@ -12,10 +12,10 @@ tg_history_load_limit = 400
 tg_recent_limit = 20
 
 [general.llm]
-# Mistral API: primary 8b (625k TPM / 3.13 RPS), fallback 14b (937k TPM / 0.5 RPS)
+# Mistral API: primary 14b (937.5k TPM / 30 rpm), fallback 8b (625k TPM / 188 rpm)
 endpoint.baseUrl = "https://api.mistral.ai/v1/"
-endpoint.model = "ministral-8b-2512"
-endpoint.fallback_model = "ministral-14b-2512"
+endpoint.model = "ministral-14b-2512"
+endpoint.fallbackModel = "ministral-8b-2512"
 
 [general.embedding]
 # Mistral embeddings (1024-мера), RAG-память. ВНИМАНИЕ: model ВНУТРИ endpoint.*

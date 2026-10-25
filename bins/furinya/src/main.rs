@@ -39,18 +39,26 @@ async fn main() -> Result<()> {
     );
 
     let prompts = Prompts::load_from_dir("prompts", &cfg)?;
-    let use_full = std::env::var("FURINYA_FULL_PROMPT")
+    // Режим Telegram выбирается ниже (telegram_enabled + нет FURINYA_CONSOLE).
+    let telegram_mode = cfg.general.telegram_enabled && std::env::var("FURINYA_CONSOLE").is_err();
+    let full_env = std::env::var("FURINYA_FULL_PROMPT")
         .map(|v| v == "1")
         .unwrap_or(false);
     let raw_mode = std::env::var("FURINYA_RAW")
         .map(|v| v == "1")
         .unwrap_or(false);
+    // В Telegram нужен ПОЛНЫЙ system.md: оценка хода, ответ только через
+    // send_telegram_message, анти-повтор, правила idle/сна. Раньше прод брал
+    // build_character_prompt() (только личность) — модель не знала ни про
+    // оценку, ни про инструменты, и скатывалась в дежурные формулы.
+    // В консоли tool-loop нет, там достаточно личности (если не задан FULL).
+    let use_full = telegram_mode || full_env;
     let mut system_prompt = if use_full {
         prompts.build_system_prompt()
     } else {
         prompts.build_character_prompt()
     };
-    if use_full {
+    if full_env {
         system_prompt.push_str(
             "\n\n# ОТЛАДКА (терминал)\nНа КАЖДОЕ сообщение пользователя ПЕРВЫМ делом вызови инструмент #ask для освежения контекста. ПЕРЕД ответом ОБЯЗАТЕЛЬНО напиши служебные строки:\n- thought: <рассуждения>\n- emotion: <эмоция>\n- intention: <намерение>\nТолько ПОСЛЕ них пиши ответ.",
         );
@@ -61,7 +69,13 @@ async fn main() -> Result<()> {
         prompts.system.len(),
         prompts.character_base.len(),
         prompts.character_appearance.len(),
-        if use_full { " (FULL + thinking)" } else { "" }
+        if full_env {
+            " (FULL + thinking)"
+        } else if use_full {
+            " (FULL)"
+        } else {
+            ""
+        }
     );
 
     let client = LlmClient::from_config(&cfg)?;
@@ -89,7 +103,7 @@ async fn main() -> Result<()> {
 
     migrate_embeddings_if_needed(&cfg, &diary, &mut diary_entries, &embed_identity).await;
 
-    if cfg.general.telegram_enabled && std::env::var("FURINYA_CONSOLE").is_err() {
+    if telegram_mode {
         info!("[furinya] telegram_enabled=true — запуск TDLib режима");
         if std::env::var("FURINYA_TD_QUIET").is_ok() {
             use std::os::unix::io::IntoRawFd;

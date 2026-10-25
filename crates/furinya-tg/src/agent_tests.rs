@@ -382,7 +382,9 @@ fn send_tool(parts: &[&str]) -> ToolReply {
 async fn live_turn_assesses_injects_and_sends_one_message() {
     let f = fixture(
         "live",
-        vec![send_tool(&["Я тут, Саш. Расскажи, что случилось."])],
+        vec![send_tool(&[
+            "Ты написал, что тебе тяжело. Я не буду делать вид, что знаю, как это исправить. Расскажи, что именно случилось.",
+        ])],
         "СОСТОЯНИЕ ОН: тревога, просит поддержки\nСОСТОЯНИЕ Я: спокойно, готова слушать\nПЛАН: признать боль и спросить, что нужно",
     )
     .await;
@@ -410,7 +412,7 @@ async fn live_turn_assesses_injects_and_sends_one_message() {
     // 1. Ровно одно сообщение ушло, текст — из tool_call.
     let sent = sent_messages(&f.rx);
     assert_eq!(sent.len(), 1, "ожидалось 1 сообщение, отправлено: {sent:?}");
-    assert!(sent[0].contains("Я тут, Саш"));
+    assert!(sent[0].contains("Я не буду делать вид"));
 
     // 2. Оценка инжектится в system-промпт хода.
     let main_reqs = f.state.main_requests();
@@ -539,7 +541,9 @@ async fn idle_stay_quiet_is_silent_and_writes_no_state() {
 async fn broken_assessment_degrades_to_turn_without_state() {
     let f = fixture(
         "broken_assess",
-        vec![send_tool(&["Я здесь, Саш."])],
+        vec![send_tool(&[
+            "Привет, Саш. Я как раз думала о вчерашнем разговоре — ты дочитал ту книгу?",
+        ])],
         "какой-то мусор без нужных меток",
     )
     .await;

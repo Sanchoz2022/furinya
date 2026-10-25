@@ -176,10 +176,11 @@ pub fn default_lib_path() -> PathBuf {
     PathBuf::from("libs/libtdjson.so")
 }
 
-#[cfg(test)]
 impl TdClient {
-    /// Тестовый клиент БЕЗ TDLib: команды уходят в канал, который читает тест.
-    /// Нужен, чтобы прогнать полный ход агента офлайн (без Telegram).
+    /// Тестовый клиент БЕЗ TDLib: команды уходят в канал, который читает тест
+    /// (или example `replay`). Нужен, чтобы прогнать полный ход агента без
+    /// Telegram: офлайн-тесты и ручной прогон на реальных API.
+    #[doc(hidden)]
     pub fn test_client() -> (Self, Receiver<Option<String>>) {
         let (cmd_tx, rx) = channel();
         (

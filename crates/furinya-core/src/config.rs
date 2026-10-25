@@ -724,11 +724,11 @@ mod tests {
         let cfg = Config::load(&root).expect("config.toml должен парситься");
         assert_eq!(cfg.general.character_name, "Furinya");
         assert_eq!(cfg.general.papik_chat_id, 5005580127);
-        // Основная LLM — Mistral API (ministral-8b: 625k TPM / 3.13 RPS — если
-        // бы остался medium: 20k TPM / 1 RPS душит под 429), резерв — Ministral 14B.
+        // Основная LLM — Mistral API: ministral-14b (937.5k TPM / 30 rpm, качество),
+        // резерв — ministral-8b (625k TPM / 188 rpm, если 14b ловит 429/5xx).
         assert!(cfg.general.llm.endpoint.base_url.contains("api.mistral.ai"));
-        assert_eq!(cfg.general.llm.endpoint.model, "ministral-8b-2512");
-        assert_eq!(cfg.general.llm.endpoint.fallback_model, "ministral-14b-2512");
+        assert_eq!(cfg.general.llm.endpoint.model, "ministral-14b-2512");
+        assert_eq!(cfg.general.llm.endpoint.fallback_model, "ministral-8b-2512");
         // Эмбеддинги: Gemini embeddings (OpenAI-совместимый слой Google) —
         // локальный llama.cpp на этом хосте считал запись ~4.6 с и грел железо.
         // Модель обязана лежать ВНУТРИ endpoint.* — иначе в запрос уходит пустой
