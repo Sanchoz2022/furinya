@@ -495,6 +495,63 @@ async fn stay_quiet_on_live_message_is_blocked() {
 }
 
 #[tokio::test]
+async fn second_send_in_same_turn_is_blocked() {
+    // Регресс 25.10 22:33: модель спросила про трек, сходила в память (`ask`)
+    // и вторым send_telegram_message «ответила» за Сашу его же старой цитатой.
+    // Один ход = одна отправка: второй send не уходит в чат.
+    let f = fixture(
+        "second_send",
+        vec![
+            send_tool(&["А какой трек или гитарный риф последнее время зацепил особенно?"]),
+            ("ask".to_string(), json!({"query": "музыка Саши"}).to_string()),
+            send_tool(&["Ах, Seven Colors, конечно! 🎸", "Какие песни особенно зацепили?"]),
+        ],
+        "СОСТОЯНИЕ ОН: нейтрально\nСОСТОЯНИЕ Я: любопытно\nПЛАН: спросить про трек",
+    )
+    .await;
+
+    let mut diary_entries = Vec::new();
+    let mut tg_history = vec![Message::system("system")];
+    let mut tg_history_full: Vec<(i64, bool, String, i64)> = Vec::new();
+
+    handle_new_message(
+        incoming("Наслаждаясь инструментами в треках"),
+        &f.llm,
+        &f.client,
+        &f.diary,
+        &f.prompts,
+        &mut diary_entries,
+        &mut tg_history,
+        &mut tg_history_full,
+        SYSTEM_PROMPT,
+        &f.cfg,
+        MY_ID,
+        false,
+    )
+    .await;
+
+    let sent = sent_messages(&f.rx);
+    assert_eq!(
+        sent.len(),
+        1,
+        "второй send в том же ходу не должен уходить в чат: {sent:?}"
+    );
+    assert!(sent[0].contains("какой трек"), "{sent:?}");
+    assert!(
+        !sent.iter().any(|s| s.contains("Seven Colors")),
+        "модель ответила за Сашу старой цитатой: {sent:?}"
+    );
+
+    let dump = f.state.main_requests().iter().map(|r| r.to_string()).collect::<Vec<_>>().join("\n");
+    assert!(
+        dump.contains("Ты НЕ отвечаешь за Сашу"),
+        "модель не получила запрет отвечать за него: {dump}"
+    );
+
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+#[tokio::test]
 async fn idle_stay_quiet_is_silent_and_writes_no_state() {
     let f = fixture(
         "idle",
