@@ -628,23 +628,27 @@ async fn bootstrap_self_state(
     prompts: &Prompts,
     cfg: &Config,
     tg_history_full: &[(i64, bool, String, i64)],
+    client: &TdClient,
 ) {
     let path = std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md");
     if path.exists() {
         return;
     }
+    // Подписи — по аккаунтам Telegram, а не по хардкоду «Саша/Александр».
+    crate::identity::resolve_many(
+        client,
+        tg_history_full
+            .iter()
+            .filter(|(_, is_me, _, _)| !*is_me)
+            .map(|(sender, _, _, _)| *sender),
+    )
+    .await;
     let mut chat_text = String::new();
-    for (sender, is_me, text, date) in tg_history_full {
+    for (sender, _is_me, text, date) in tg_history_full {
         if text.trim().is_empty() {
             continue;
         }
-        let who = if *is_me {
-            cfg.general.character_name.clone()
-        } else if *sender == cfg.general.papik_chat_id {
-            cfg.general.papik_name.clone()
-        } else {
-            format!("user{}", sender)
-        };
+        let who = crate::identity::display_name(cfg, cfg.general.telegram_my_id, *sender);
         chat_text.push_str(&format!("[{}] {}: {}\n", format_ts(*date), who, text));
     }
     // Температура как у консолидации (0.2): иначе модель уходит в
@@ -928,7 +932,7 @@ fn cliche_hit(text: &str) -> Option<&'static str> {
     None
 }
 
-/// Обрубок вместо реплики: одно слово («Сашенька…») или недописанная мысль
+/// Обрубок вместо реплики: одно слово (просто имя/обращение) или недописанная мысль
 /// («Ты просто так спросили…»). Такую часть не отправляем: это пинг внимания,
 /// а не ответ. Живую короткую реплику («Я не знаю.») не трогаем.
 fn fragment_hit(text: &str) -> Option<&'static str> {
@@ -1376,19 +1380,19 @@ async fn execute_tg_tool(
                 Ok(vec) => {
                     let hits = diary.query_top_n(diary_entries, &vec, 6);
                     if hits.is_empty() {
-                        "Дневник: релевантных воспоминаний не найдено (Саша на это \
+                        "Дневник: релевантных воспоминаний не найдено (он на это \
                          ничего не отвечал — это только твой поиск по памяти)."
                             .to_string()
                     } else {
                         // ВАЖНО: это ТОЛЬКО её воспоминания, а не новая реплика
-                        // Саши. Без явной рамки модель принимала старые цитаты
-                        // из дневника за его ответ и «отвечала» на собственный
-                        // вопрос (25.10 22:33: спросила про трек → ask → «Ах,
-                        // Seven Colors, конечно!»).
+                        // собеседника. Без явной рамки модель принимала старые
+                        // цитаты из дневника за его ответ и «отвечала» на
+                        // собственный вопрос (25.10 22:33: спросила про трек →
+                        // ask → «Ах, Seven Colors, конечно!»).
                         let mut out = String::from(
                             "Твои ВОСПОМИНАНИЯ из дневника (это НЕ новое сообщение \
-                             Саши и не его ответ — это старые записи и цитаты из \
-                             прошлого; не отвечай за него):\n",
+                             от него и не его ответ — это старые записи и цитаты \
+                             из прошлого; не отвечай за него):\n",
                         );
                         for h in &hits {
                             let preview: String = h
@@ -1959,13 +1963,13 @@ pub async fn handle_new_message(
         .to_string();
 
     let sender = msg["sender_id"]["user_id"].as_i64().unwrap_or(0);
-    let sender_name = if sender == my_id {
-        cfg.general.character_name.clone()
-    } else if sender == cfg.general.papik_chat_id {
-        cfg.general.papik_name.clone()
-    } else {
-        format!("user{}", sender)
-    };
+    // Подпись автора — по live-профилю Telegram (first_name/last_name/@username),
+    // а не по захардкоженному имени. Для владельца дополнительно сверяем
+    // papik_username: аккаунт мог сменить имя, id — остаётся главным признаком.
+    if !is_idle && sender != 0 && sender != my_id {
+        crate::identity::resolve(client, sender).await;
+    }
+    let sender_name = crate::identity::display_name(cfg, my_id, sender);
 
     // Свои исходящие сообщения НЕ обрабатываем: иначе бот отвечает сам себе,
     // скачивает и «распознаёт» СОБСТВЕННЫЕ голосовые (засоряя Whisper и
@@ -2217,7 +2221,7 @@ pub async fn handle_new_message(
     // Инструмент не выполнен: stay_quiet на живом сообщении, текст на голосовое,
     // кривой JSON в send_telegram_message. Ход в этом случае НЕ закрываем —
     // даём модели ещё один ход ответить. Раньше здесь падало в canned-заглушку
-    // («Сашенька, я чуть зависла…») — ровно тот дежурный ответ, который чиним.
+    // («<имя>, я чуть зависла…») — ровно тот дежурный ответ, который чиним.
     let mut tool_blocked = false;
     // Инструментальный диалог ЭТОГО вызова (assistant tool_calls → tool-результаты).
     // Ничего с role=tool не должно попадать в tg_history: «осиротевший» tool
@@ -2495,7 +2499,7 @@ pub async fn handle_new_message(
             ));
             if turn == max_turns {
                 // Модель так и не позвала инструмент — generic-заглушка запрещена:
-                // лучше тишина, чем «Сашенька, я чуть зависла…».
+                // лучше тишина, чем «<имя>, я чуть зависла…».
                 warn!(
                     "[tg] модель не вернула tool_call за {} ходов — молчим",
                     max_turns
@@ -2554,7 +2558,7 @@ pub async fn handle_new_message(
                     turn_ctx.push(Message::tool_result(
                         Some(call_id),
                         Some("stay_quiet".to_string()),
-                        "ЗАПРЕЩЕНО: Саша написал тебе — нужно ответить (send_telegram_message) \
+                        "ЗАПРЕЩЕНО: он написал тебе — нужно ответить (send_telegram_message) \
                          или отреагировать (react_with_emoji). Молчать в ответ на живое сообщение \
                          нельзя. Если писать нечего — поставь реакцию."
                             .to_string(),
@@ -2864,17 +2868,11 @@ pub async fn handle_new_message(
 fn situation_exchange_text(cfg: &Config, rows: &[(i64, bool, String, i64)]) -> String {
     let start = rows.len().saturating_sub(12);
     let mut out = String::new();
-    for (sender, is_me, text, date) in &rows[start..] {
+    for (sender, _is_me, text, date) in &rows[start..] {
         if text.trim().is_empty() {
             continue;
         }
-        let who = if *is_me {
-            cfg.general.character_name.clone()
-        } else if *sender == cfg.general.papik_chat_id {
-            cfg.general.papik_name.clone()
-        } else {
-            format!("user{}", sender)
-        };
+        let who = crate::identity::display_name(cfg, cfg.general.telegram_my_id, *sender);
         out.push_str(&format!("{} {}: {}\n", format_ts(*date), who, text));
     }
     out
@@ -3140,6 +3138,18 @@ pub async fn run_telegram_mode(
     // Уснула: пока первыми не пишем (проснётся на его сообщение).
     let mut asleep = false;
     let papik = cfg.general.papik_chat_id;
+    // Профиль владельца из Telegram (first_name/last_name/@username) — единый
+    // источник подписи в логах и подсказка, если papik_username ещё не задан.
+    if let Some(owner) = crate::identity::resolve(&client, papik).await {
+        info!("[tg] владелец: {} (id={})", owner.display(), owner.id);
+        if cfg.general.papik_username_clean().is_none() {
+            if let Some(username) = owner.username.as_deref() {
+                info!(
+                    "[tg] подсказка: papik_username = \"{username}\" (можно вписать в config.toml)"
+                );
+            }
+        }
+    }
     let mut tg_history_full: Vec<(i64, bool, String, i64)> = Vec::new();
     // id уже загруженных сообщений — защита от дублей при пагинации.
     let mut history_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
@@ -3273,16 +3283,24 @@ pub async fn run_telegram_mode(
                             let start = tg_history_full.len().saturating_sub(recent_limit);
                             let recent: Vec<_> = tg_history_full[start..].to_vec();
                             let recent_len = recent.len();
+                            // Профили авторов (first_name/@username) — чтобы в
+                            // контексте стояли аккаунты, а не хардкод «Саша».
+                            crate::identity::resolve_many(
+                                &client,
+                                recent
+                                    .iter()
+                                    .filter(|(_, is_me, _, _)| !*is_me)
+                                    .map(|(sender, _, _, _)| *sender),
+                            )
+                            .await;
                             let mut hist: Vec<Message> =
                                 vec![Message::system(tg_system_prompt.clone())];
                             for (sender, is_me, text, date) in &recent {
-                                let who = if *is_me {
-                                    cfg.general.character_name.clone()
-                                } else if *sender == cfg.general.papik_chat_id {
-                                    cfg.general.papik_name.clone()
-                                } else {
-                                    format!("user{}", sender)
-                                };
+                                let who = crate::identity::display_name(
+                                    cfg,
+                                    cfg.general.telegram_my_id,
+                                    *sender,
+                                );
                                 let ts = format_ts(*date);
                                 let line = format!("[{}] {}: {}", ts, who, text);
                                 if *is_me {
@@ -3303,7 +3321,8 @@ pub async fn run_telegram_mode(
                             // живой материал (иначе модель молчит в пустоту).
                             if !self_state_bootstrapped && tg_history_full.len() >= 20 {
                                 self_state_bootstrapped = true;
-                                bootstrap_self_state(llm, prompts, cfg, &tg_history_full).await;
+                                bootstrap_self_state(llm, prompts, cfg, &tg_history_full, &client)
+                                    .await;
                             }
                             // Мало сообщений — TDLib отдал локальный кэш, а полный
                             // список с сервера ещё не пришёл. Повторяем позже.
@@ -3427,7 +3446,7 @@ pub async fn run_telegram_mode(
                     // при context overflow — см. после handle_new_message).
                     //
                     // ВАЖНО: это НЕ «режим сна». Раньше здесь бот засыпал и
-                    // переставал писать первой до сообщения Александра — после
+                    // переставал писать первой до сообщения собеседника — после
                     // трёх дней тишины инициатива умирала навсегда. Теперь
                     // «сон» = только тихие часы, а в активные часы после
                     // консолидации инициатива продолжает жить.
@@ -3440,7 +3459,7 @@ pub async fn run_telegram_mode(
                             furinya_diary::ChatTurn::from_tg_full(
                                 &tg_history_full,
                                 &cfg.general.character_name,
-                                &cfg.general.papik_name,
+                                &crate::identity::owner_display(cfg),
                             );
                         match consolidate_memory(
                             &cool_llm,
@@ -3570,6 +3589,9 @@ pub async fn run_telegram_mode(
                 Err(_) => break,
             }
         };
+        // Кэшируем профили аккаунтов из updateUser/user — подпись реплик идёт
+        // по реальному имени/username, а не по конфигу или хардкоду.
+        crate::identity::remember_from_update(&v);
         if v.get("@type").and_then(|x| x.as_str()) == Some("updateNewMessage") {
             // Сброс idle-таймера — только на ЧУЖИЕ сообщения: собственные
             // исходящие (updateNewMessage is_outgoing) активностью юзера
@@ -3653,8 +3675,35 @@ pub async fn run_telegram_mode(
                     continue;
                 }
                 if dispatch_chat_id != 0 && dispatch_chat_id != cfg.general.papik_chat_id {
-                    tracing::debug!("[tg] updateNewMessage из чата {} — локдаун papik_only, пропущено", dispatch_chat_id);
-                    continue;
+                    // Чужой чат — но владелец может писать с другого аккаунта.
+                    // Тогда решает username (id чата тут уже не совпадает).
+                    let sender_id = v["message"]["sender_id"]["user_id"]
+                        .as_i64()
+                        .unwrap_or(0);
+                    let owner_by_username = if sender_id != 0
+                        && cfg.general.papik_username_clean().is_some()
+                    {
+                        crate::identity::resolve(&client, sender_id)
+                            .await
+                            .map(|p| {
+                                crate::identity::is_owner(
+                                    cfg,
+                                    p.id,
+                                    p.username.as_deref(),
+                                )
+                            })
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if !owner_by_username {
+                        tracing::debug!("[tg] updateNewMessage из чата {} — локдаун papik_only, пропущено", dispatch_chat_id);
+                        continue;
+                    }
+                    info!(
+                        "[tg] чат {} — владелец по username, пропускаю (локдаун обойдён легально)",
+                        dispatch_chat_id
+                    );
                 }
                 handle_new_message(
                     v,
@@ -3697,7 +3746,7 @@ pub async fn run_telegram_mode(
                         furinya_diary::ChatTurn::from_tg_full(
                             &tg_history_full,
                             &cfg.general.character_name,
-                            &cfg.general.papik_name,
+                            &crate::identity::owner_display(cfg),
                         );
                     match consolidate_memory(
                         &cool_llm,
@@ -3733,13 +3782,11 @@ pub async fn run_telegram_mode(
                     let tl_start = tg_history_full.len().saturating_sub(rr);
                     let mut hist = vec![Message::system(tg_system_prompt.clone())];
                     for (sender, is_me, text, date) in &tg_history_full[tl_start..] {
-                        let who = if *is_me {
-                            cfg.general.character_name.clone()
-                        } else if *sender == cfg.general.papik_chat_id {
-                            cfg.general.papik_name.clone()
-                        } else {
-                            format!("user{}", sender)
-                        };
+                        let who = crate::identity::display_name(
+                            cfg,
+                            cfg.general.telegram_my_id,
+                            *sender,
+                        );
                         let line = format!("[{}] {}: {}", format_ts(*date), who, text);
                         if *is_me {
                             hist.push(Message::assistant(line));

@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
             let chat_turns = furinya_diary::ChatTurn::from_messages_no_dates(
                 &history,
                 &cfg.general.character_name,
-                &cfg.general.papik_name,
+                &prompts.papik_name(),
             );
             let n = furinya_diary::consolidate_memory(
                 &client,
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
             let chat_turns = furinya_diary::ChatTurn::from_messages_no_dates(
                 &history,
                 &cfg.general.character_name,
-                &cfg.general.papik_name,
+                &prompts.papik_name(),
             );
             let n = furinya_diary::consolidate_memory(
                 &client,

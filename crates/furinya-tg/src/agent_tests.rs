@@ -322,6 +322,7 @@ liveliness_typo_probability = 0.0
         character_base: String::new(),
         character_appearance: String::new(),
         extra,
+        papik_name: "Собеседник".to_string(),
     };
     let (client, rx) = TdClient::test_client();
 

@@ -2,7 +2,8 @@
 //!
 //! Промпты лежат в папке `prompts/` рядом с конфигом. Внутри — markdown с
 //! YAML front-matter (`---\n...\n---`), который вырезается. Поддерживаются
-//! переменные `${CHARACTER_NAME}`, `${CHARACTER_NICKNAME}`, `${PAPIK_NAME}`.
+//! переменные `${CHARACTER_NAME}`, `${CHARACTER_NICKNAME}`, `${PAPIK_NAME}`,
+//! `${PAPIK_USERNAME}`.
 
 use crate::Config;
 use std::collections::HashMap;
@@ -23,6 +24,10 @@ pub struct Prompts {
     pub character_appearance: String,
     /// Прочие промпты по имени файла (без .md), напр. "diary_save".
     pub extra: HashMap<String, String>,
+    /// Отображаемое имя владельца (papik) после подстановки. Нужно служебным
+    /// промптам, которые собираются в коде (консолидация), чтобы не хардкодить
+    /// конкретное имя.
+    pub papik_name: String,
 }
 
 impl Prompts {
@@ -72,7 +77,13 @@ impl Prompts {
             character_base,
             character_appearance,
             extra,
+            papik_name: cfg.general.papik_display_name(),
         })
+    }
+
+    /// Отображаемое имя владельца (papik), уже с подстановкой из конфига.
+    pub fn papik_name(&self) -> &str {
+        &self.papik_name
     }
 
     /// Собирает system-промпт для LLM: system + character_base
@@ -195,7 +206,11 @@ fn build_vars(cfg: &Config) -> HashMap<&'static str, String> {
     let mut m = HashMap::new();
     m.insert("CHARACTER_NAME", cfg.general.character_name.clone());
     m.insert("CHARACTER_NICKNAME", cfg.general.character_nickname.clone());
-    m.insert("PAPIK_NAME", cfg.general.papik_name.clone());
+    m.insert("PAPIK_NAME", cfg.general.papik_display_name());
+    m.insert(
+        "PAPIK_USERNAME",
+        cfg.general.papik_username_clean().unwrap_or("").to_string(),
+    );
     m
 }
 

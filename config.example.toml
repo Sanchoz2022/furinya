@@ -8,6 +8,10 @@ telegram_my_id = 8337379413
 character_name = "Furinya"
 papik_chat_id = 5005580127
 papik_name = "Александр"
+
+# Telegram username владельца без @ (необязательно). Второй признак кроме
+# papik_chat_id: нужен, если владелец пишет с другого аккаунта. Пусто = не задан.
+papik_username = ""
 tg_history_load_limit = 400
 tg_recent_limit = 20
 

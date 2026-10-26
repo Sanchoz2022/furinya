@@ -68,10 +68,12 @@ pub async fn consolidate_memory(
         // Промпт — ИЗ ВНЕШНЕГО ФАЙЛА, не из кода.
         // Дата обязательна: без неё модель выдумывала год в «Тимestamps»
         // (26.10.2023 вместо 2026). Плюс явная граница ролей — иначе её
-        // собственные idle-мысли превращались в «инициативу Александра».
+        // собственные idle-мысли превращались в «инициативу» собеседника.
+        // Имя собеседника — из конфига/live-профиля, не из кода.
         let today = chrono::Local::now().format("%d.%m.%Y").to_string();
+        let papik = prompts.papik_name();
         let system = format!(
-            "{}\n\nСЕГОДНЯ: {today}. Все даты бери из входных записей и этого года — не выдумывай другой год. Если во входных записях НЕТ реплик Александра, не приписывай ему инициативу, действия, слова или ответы: это могли быть её собственные мысли и сообщения.\n\nCRITICAL: Output valid markdown ONLY. Each memory piece MUST start with a JSON object `{{\"confidence\":X}}` on its own line, followed by a blank line, then the body. Separate pieces with `\\n\\n---\\n\\n`. Do NOT wrap output in ```markdown``` fences. Do NOT add `**Rationale:**` or any meta-commentary outside the JSON+body format. If there is no real new information, output NOTHING.",
+            "{}\n\nСЕГОДНЯ: {today}. Все даты бери из входных записей и этого года — не выдумывай другой год. Если во входных записях НЕТ реплик второго участника ({papik}), не приписывай ему инициативу, действия, слова или ответы: это могли быть её собственные мысли и сообщения.\n\nCRITICAL: Output valid markdown ONLY. Each memory piece MUST start with a JSON object `{{\"confidence\":X}}` on its own line, followed by a blank line, then the body. Separate pieces with `\\n\\n---\\n\\n`. Do NOT wrap output in ```markdown``` fences. Do NOT add `**Rationale:**` or any meta-commentary outside the JSON+body format. If there is no real new information, output NOTHING.",
             prompts.sleep_consolidator()
         );
 
@@ -141,8 +143,9 @@ pub async fn consolidate_memory(
             profile_old, history_old, chat_text
         );
         let today = chrono::Local::now().format("%d.%m.%Y").to_string();
+        let papik = prompts.papik_name();
         let system = format!(
-            "{}\n\nСЕГОДНЯ: {today}. Год в датах — этот; не выдумывай другой. Не приписывай Александру слов или действий, которых нет в диалоге.",
+            "{}\n\nСЕГОДНЯ: {today}. Год в датах — этот; не выдумывай другой. Не приписывай собеседнику ({papik}) слов или действий, которых нет в диалоге.",
             prompts.chat_history_consolidator()
         );
         let summary = llm

@@ -30,7 +30,7 @@ pub use situation::{SituationNote, SituationStore};
 pub struct ChatTurn {
     /// Дата-время в читаемом виде, напр. "12.07 22:53".
     pub date: String,
-    /// Имя говорящего (из config: character_name / papik_name), напр. "Фуринья" / "Александр".
+    /// Имя говорящего (из config: character_name / papik_name), напр. "Фуринья" / имя из конфига.
     pub who: String,
     /// Текст реплики.
     pub text: String,

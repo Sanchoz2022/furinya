@@ -43,6 +43,11 @@ pub struct GeneralConfig {
     pub character_nickname: String,
     #[serde(default = "default_papik_name")]
     pub papik_name: String,
+    /// Telegram username владельца (без `@`). Необязательный, но полезный
+    /// второй признак: основной — `papik_chat_id`. Сравнение регистронезависимое,
+    /// чтобы не привязывать код к конкретному имени/аккаунту.
+    #[serde(default)]
+    pub papik_username: String,
     #[serde(default)]
     pub papik_chat_id: i64,
     /// Сколько последних сообщений чата попадает в контекст модели напрямую.
@@ -71,6 +76,31 @@ pub struct GeneralConfig {
     pub embedding: LlmEndpoint,
 }
 
+impl GeneralConfig {
+    /// Telegram username владельца без `@`, если он задан в конфиге.
+    pub fn papik_username_clean(&self) -> Option<&str> {
+        let username = self.papik_username.trim().trim_start_matches('@');
+        if username.is_empty() {
+            None
+        } else {
+            Some(username)
+        }
+    }
+
+    /// Отображаемое имя владельца: `papik_name`, иначе его Telegram-username,
+    /// иначе нейтральное «собеседник». Ни одно конкретное имя в коде не зашито.
+    pub fn papik_display_name(&self) -> String {
+        let name = self.papik_name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        if let Some(username) = self.papik_username_clean() {
+            return format!("@{username}");
+        }
+        "собеседник".to_string()
+    }
+}
+
 /// LLM-эндпоинт в формате Kuni: [general.llm] -> endpoint.{baseUrl, bearerKey, model}
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct LlmEndpoint {
@@ -85,7 +115,9 @@ fn default_character_nickname() -> String {
     "@furinya_chan".into()
 }
 fn default_papik_name() -> String {
-    "Александр".into()
+    // Пусто = «не задано»: имя собеседника не хардкодится, а берётся из
+    // papik_username / live-профиля Telegram (см. papik_display_name).
+    String::new()
 }
 fn default_lockdown() -> String {
     "papik_only".into()

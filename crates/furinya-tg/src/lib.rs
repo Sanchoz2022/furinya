@@ -15,6 +15,7 @@
 pub mod assessment;
 pub mod auth;
 pub mod agent;
+pub mod identity;
 pub mod idle;
 
 #[cfg(test)]
