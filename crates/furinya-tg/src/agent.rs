@@ -25,8 +25,8 @@ use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::assessment::{
-    Assessment, build_assess_input, format_assessment, parse_assessment, read_chat_state,
-    write_chat_state,
+    Assessment, build_assess_input, build_idle_assess_input, format_assessment, parse_assessment,
+    read_chat_state, write_chat_state,
 };
 use crate::{TdClient, UpdateLoop, auth, default_lib_path};
 
@@ -957,6 +957,19 @@ fn fragment_hit(text: &str) -> Option<&'static str> {
     None
 }
 
+/// Часть — это ТОЛЬКО действие в скобках: «(тихо смеётся)», «(потягивается)».
+/// Такое действие не отправляется отдельным сообщением: оно приклеивается к
+/// соседней живой реплике (иначе выглядит как обрубок и попадает под
+/// `fragment_hit`).
+fn action_only(text: &str) -> Option<&str> {
+    let t = text.trim();
+    let inner = t.strip_prefix('(')?.strip_suffix(')')?;
+    if inner.trim().is_empty() || inner.contains('(') {
+        return None;
+    }
+    Some(inner.trim())
+}
+
 /// Эмбеддинг-защита от самоповторов — порт kuni (send_telegram_message.cpp,
 /// «LLM is repeating itself»). Проверяет черновик ответа против недавних
 /// реплик бота: если максимальная похожесть выше anti_repeat_trigger_max
@@ -1140,10 +1153,43 @@ async fn execute_tg_tool(
             }
             // Живая очередь сообщений: цель — 1-2 части; жёсткий потолок —
             // cfg.misc.max_message_parts (3). Лучше меньше, чем поток пингов.
+            // Шаг 0 — действия в скобках: «(тихо смеётся)» — часть ЖИВОЙ
+            // реплики, а не отдельное сообщение. Приклеиваем к предыдущей части
+            // (или к следующей, если действие стоит первым), чтобы в чат не
+            // уходил голый обрубок в скобках.
+            let mut with_actions: Vec<String> = Vec::new();
+            let mut pending_action = String::new();
+            for p in parts {
+                if action_only(&p).is_some() {
+                    if let Some(last) = with_actions.last_mut() {
+                        if !last.is_empty() {
+                            last.push(' ');
+                        }
+                        last.push_str(p.trim());
+                    } else {
+                        if !pending_action.is_empty() {
+                            pending_action.push(' ');
+                        }
+                        pending_action.push_str(p.trim());
+                    }
+                    continue;
+                }
+                let p = if pending_action.is_empty() {
+                    p
+                } else {
+                    format!("{} {}", std::mem::take(&mut pending_action), p.trim())
+                };
+                with_actions.push(p);
+            }
+            // Действие без текста вообще (модель прислала только «(улыбается)»)
+            // не отправляем отдельным сообщением.
+            if !pending_action.is_empty() {
+                debug!("[tg] действие без текста отброшено: {:?}", pending_action);
+            }
             // Шаг 1 — склейка мелких частей: если оба соседних фрагмента короткие
             // (<40 симв) — сливаем в одно сообщение (до ~160 симв), чтобы вместо
             // 4 пшиков приходила 1 нормальная реплика.
-            let raw_parts = parts;
+            let raw_parts = with_actions;
             let mut merged: Vec<String> = Vec::new();
             for p in raw_parts {
                 let p = p.to_string();
@@ -1783,6 +1829,92 @@ async fn execute_tg_tool(
     }
 }
 
+/// Текст внутреннего `[idle]`-стимула. Вынесен отдельно, чтобы replay гонял
+/// РОВНО те же слова, что прод (иначе проверка «почему молчит» врёт).
+pub fn idle_stimulus_text(
+    hour: u32,
+    minute: u32,
+    silent_minutes: u64,
+    self_state_block: &str,
+    own_hint: &str,
+    news_block: &str,
+) -> String {
+    format!(
+        "[idle] [внутреннее] Сейчас {hour}:{minute:02} по времени Саши — активные часы. \
+         Он не писал {silent_minutes} минут; это нормально, у него своя жизнь и он не \
+         обязан отвечать сразу. Сейчас ТВОЙ черёд, и по умолчанию ты пишешь первой: \
+         живая девушка не ждёт разрешения и не молчит из вежливости — она вспоминает, \
+         замечает, хочет поделиться. Молчи (stay_quiet) только если у тебя правда нет \
+         ни одной живой мысли, дела или настроения, которым хочется поделиться. \
+         «Он, наверное, занят/спит» — НЕ причина молчать: если занят, он просто \
+         ответит позже.{self_state_block} \n\n\
+         Опирайся на своё состояние и свои дела: скажи что-то КОНКРЕТНОЕ из своей \
+         жизни, мыслей или настроения, а не дежурное «я тут». НЕ пиши «ты тут?», не \
+         жалуйся на тишину, не напоминай о себе пустым «я здесь» и не повторяй свои \
+         прошлые реплики. Напиши ОДНУ короткую живую реплику — можно с действием в \
+         скобках, например (потягивается) или (тихо смеётся), если оно правда \
+         уместно.{own_hint}{news_block}"
+    )
+}
+
+/// Один вызов внутренней оценки хода. Ошибка/пустой промпт — мягкая
+/// деградация: ход продолжается без оценки.
+async fn assess_turn(
+    llm: &LlmClient,
+    prompts: &Prompts,
+    input: String,
+    client: &TdClient,
+    chat_id: i64,
+    show_typing: bool,
+) -> Option<Assessment> {
+    let assess_prompt = prompts.assess();
+    if assess_prompt.trim().is_empty() {
+        warn!("[tg] промпт оценки (assess.md) отсутствует — ход без оценки");
+        return None;
+    }
+    if show_typing {
+        // Пока идёт оценка — «печатает…», иначе несколько секунд тишины
+        // выглядят как зависший бот. На idle не показываем: она может
+        // решить промолчать, и мигание «печатает» будет ложью.
+        client.send_action_typing(chat_id);
+    }
+    let assess_llm = llm.with_temperature(0.3);
+    let call = assess_llm.chat(vec![Message::system(assess_prompt), Message::user(input)], None);
+    match tokio::time::timeout(Duration::from_secs(20), call).await {
+        Ok(Ok(resp)) => {
+            let raw = resp
+                .choices
+                .first()
+                .and_then(|c| match &c.message.content {
+                    MessageContent::Text(s) => Some(s.clone()),
+                    MessageContent::Parts(_) => None,
+                })
+                .unwrap_or_default();
+            match parse_assessment(&raw) {
+                Some(a) => {
+                    info!(
+                        "[tg] ОЦЕНКА ХОДА:\n  ОН: {}\n  Я: {}\n  ПЛАН: {}",
+                        a.he, a.me, a.plan
+                    );
+                    Some(a)
+                }
+                None => {
+                    warn!("[tg] оценка хода: модель не вернула 3 строки — ход без оценки");
+                    None
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            warn!("[tg] оценка хода: LLM ошибка ({e}) — ход без оценки");
+            None
+        }
+        Err(_) => {
+            warn!("[tg] оценка хода: таймаут 20с — ход без оценки");
+            None
+        }
+    }
+}
+
 /// Обрабатывает одно входящее сообщение (или idle-стимул) агентным циклом.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::collapsible_if)]
@@ -2015,60 +2147,34 @@ pub async fn handle_new_message(
     // модель возвращает три строки — СОСТОЯНИЕ ОН / СОСТОЯНИЕ Я / ПЛАН.
     // Дальше блок инжектится в system-промпт хода («Оценка хода»), а per-chat
     // состояние пишется в data/diary/chat_state/<chat_id>.md.
+    // На idle его слов нет, но оценка всё равно нужна: без неё инициативное
+    // сообщение рождается без «моё состояние / план» и скатывается в дежурную
+    // фразу. Для idle вход честно говорит «он не писал — состояние неизвестно».
     let assessment: Option<Assessment> = if !is_idle && !his_words.trim().is_empty() {
-        let assess_prompt = prompts.assess();
-        if assess_prompt.trim().is_empty() {
-            warn!("[tg] промпт оценки (assess.md) отсутствует — ход без оценки");
-            None
-        } else {
-            let diary_dir = std::path::Path::new(&cfg.misc.diary_dir);
-            let prev_state = read_chat_state(diary_dir, chat_id);
-            // Хвост истории: последние реплики (её и его) ДО его текущего
-            // сообщения — оно идёт в оценку отдельно, без обёрток (голос/фото).
-            let hist_end = tg_history_full.len().saturating_sub(1);
-            let hist_start = hist_end.saturating_sub(6);
-            let hist_tail = situation_exchange_text(cfg, &tg_history_full[hist_start..hist_end]);
-            let input = build_assess_input(&his_words, &hist_tail, &prev_state);
-            // Пока идёт оценка — показываем «печатает…»: иначе пользователь
-            // видит тишину несколько секунд и думает, что бот завис.
-            client.send_action_typing(chat_id);
-            let assess_llm = llm.with_temperature(0.3);
-            let call = assess_llm
-                .chat(vec![Message::system(assess_prompt), Message::user(input)], None);
-            match tokio::time::timeout(Duration::from_secs(20), call).await {
-                Ok(Ok(resp)) => {
-                    let raw = resp
-                        .choices
-                        .first()
-                        .and_then(|c| match &c.message.content {
-                            MessageContent::Text(s) => Some(s.clone()),
-                            MessageContent::Parts(_) => None,
-                        })
-                        .unwrap_or_default();
-                    match parse_assessment(&raw) {
-                        Some(a) => {
-                            info!(
-                                "[tg] ОЦЕНКА ХОДА:\n  ОН: {}\n  Я: {}\n  ПЛАН: {}",
-                                a.he, a.me, a.plan
-                            );
-                            Some(a)
-                        }
-                        None => {
-                            warn!("[tg] оценка хода: модель не вернула 3 строки — ход без оценки");
-                            None
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("[tg] оценка хода: LLM ошибка ({e}) — ход без оценки");
-                    None
-                }
-                Err(_) => {
-                    warn!("[tg] оценка хода: таймаут 20с — ход без оценки");
-                    None
-                }
-            }
-        }
+        let diary_dir = std::path::Path::new(&cfg.misc.diary_dir);
+        let prev_state = read_chat_state(diary_dir, chat_id);
+        // Хвост истории: последние реплики (её и его) ДО его текущего
+        // сообщения — оно идёт в оценку отдельно, без обёрток (голос/фото).
+        let hist_end = tg_history_full.len().saturating_sub(1);
+        let hist_start = hist_end.saturating_sub(6);
+        let hist_tail = situation_exchange_text(cfg, &tg_history_full[hist_start..hist_end]);
+        let input = build_assess_input(&his_words, &hist_tail, &prev_state);
+        assess_turn(llm, prompts, input, &client, chat_id, true).await
+    } else if is_idle {
+        let diary_dir = std::path::Path::new(&cfg.misc.diary_dir);
+        let prev_state = read_chat_state(diary_dir, chat_id);
+        let hist_start = tg_history_full.len().saturating_sub(6);
+        let hist_tail = situation_exchange_text(cfg, &tg_history_full[hist_start..]);
+        let self_state = std::fs::read_to_string(diary_dir.join("self_state.md"))
+            .unwrap_or_default();
+        let local_time = Local::now().format("%H:%M").to_string();
+        let input = build_idle_assess_input(
+            &local_time,
+            &hist_tail,
+            &prev_state,
+            &self_state,
+        );
+        assess_turn(llm, prompts, input, &client, chat_id, false).await
     } else {
         None
     };
@@ -2669,17 +2775,19 @@ pub async fn handle_new_message(
     // эмоциональное состояние между ходами (общий self_state.md — про её
     // собственный день, это разные вещи). Только для ЖИВЫХ ходов: idle/сон не
     // меняют «состояние с ним» — там его состояние объективно неизвестно.
-    if let Some(a) = &assessment {
-        let updated = Local::now().format("%d.%m %H:%M").to_string();
-        if let Err(e) = write_chat_state(
-            std::path::Path::new(&cfg.misc.diary_dir),
-            chat_id,
-            a,
-            &updated,
-        ) {
-            warn!("[tg] per-chat состояние: запись не удалась ({e})");
-        } else {
-            debug!("[tg] per-chat состояние обновлено: {}", updated);
+    if !is_idle {
+        if let Some(a) = &assessment {
+            let updated = Local::now().format("%d.%m %H:%M").to_string();
+            if let Err(e) = write_chat_state(
+                std::path::Path::new(&cfg.misc.diary_dir),
+                chat_id,
+                a,
+                &updated,
+            ) {
+                warn!("[tg] per-chat состояние: запись не удалась ({e})");
+            } else {
+                debug!("[tg] per-chat состояние обновлено: {}", updated);
+            }
         }
     }
 
@@ -3258,6 +3366,10 @@ pub async fn run_telegram_mode(
                     match quiet_watcher.event(quiet) {
                         crate::idle::QuietEvent::Entered => {
                             // Вошли в тихие часы: он спит — молчим и не будим.
+                            // «Сон» существует ТОЛЬКО здесь: днём долгая тишина
+                            // не усыпляет бота (раньше это убивало инициативу).
+                            asleep = true;
+                            idle_pings = 0;
                             info!(
                                 "[tg] тихие часы ({}:{}) — сплю молча, не бужу",
                                 local_now.hour(),
@@ -3275,99 +3387,55 @@ pub async fn run_telegram_mode(
                         }
                         crate::idle::QuietEvent::None => {}
                     }
-                    // ── СОН: давно тихо (и его, и нас) ─────────────────────
-                    // Консолидация по правилу Саши: только перед сном или при
-                    // context overflow (см. после handle_new_message).
-                    if !asleep && elapsed_any >= sleep_to {
-                        // Уходим спать: сначала тихая консолидация (если ещё не
-                        // консолидировали на этом цикле), затем модель САМА
-                        // решает — сказать «ухожу дремать» или промолчать
-                        // (stay_quiet). Хардкода нет.
-                        if !consolidated {
-                            consolidated = true;
-                            // Память — служебное: холодный клиент (0.2), чтобы
-                            // живой чат (0.8) не привнёс импровизацию в факты.
-                            let cool_llm = llm.with_temperature(0.2);
-                            let chat_turns: Vec<furinya_diary::ChatTurn> =
-                                furinya_diary::ChatTurn::from_tg_full(
-                                    &tg_history_full,
-                                    &cfg.general.character_name,
-                                    &cfg.general.papik_name,
+                    // ── Тихая консолидация после долгой паузы ──────────────
+                    // Память пережимаем ровно один раз на период тишины (или
+                    // при context overflow — см. после handle_new_message).
+                    //
+                    // ВАЖНО: это НЕ «режим сна». Раньше здесь бот засыпал и
+                    // переставал писать первой до сообщения Александра — после
+                    // трёх дней тишины инициатива умирала навсегда. Теперь
+                    // «сон» = только тихие часы, а в активные часы после
+                    // консолидации инициатива продолжает жить.
+                    if !consolidated && elapsed_any >= sleep_to {
+                        consolidated = true;
+                        // Память — служебное: холодный клиент (0.2), чтобы
+                        // живой чат (0.8) не привнёс импровизацию в факты.
+                        let cool_llm = llm.with_temperature(0.2);
+                        let chat_turns: Vec<furinya_diary::ChatTurn> =
+                            furinya_diary::ChatTurn::from_tg_full(
+                                &tg_history_full,
+                                &cfg.general.character_name,
+                                &cfg.general.papik_name,
+                            );
+                        match consolidate_memory(
+                            &cool_llm,
+                            diary,
+                            prompts,
+                            diary_entries,
+                            &cfg.misc.diary_dir,
+                            &chat_turns,
+                            papik,
+                            cfg.misc.diary_keep_last,
+                            cfg.misc.active_top_k,
+                        )
+                        .await
+                        {
+                            Ok(n) => {
+                                *diary_entries = diary.load_all()?;
+                                info!(
+                                    "[tg] тихая консолидация (тишина {}с >= {}с): {} записей",
+                                    elapsed_any, sleep_to, n
                                 );
-                            match consolidate_memory(
-                                &cool_llm,
-                                diary,
-                                prompts,
-                                diary_entries,
-                                &cfg.misc.diary_dir,
-                                &chat_turns,
-                                papik,
-                                cfg.misc.diary_keep_last,
-                                cfg.misc.active_top_k,
-                            )
-                            .await
-                            {
-                                Ok(n) => {
-                                    *diary_entries = diary.load_all()?;
-                                    info!("[tg] консолидация перед сном: {} записей", n);
-                                    last_consolidated_history_len = tg_history_full.len();
-                                    // Профиль/выжимка обновились — извлекаем из них
-                                    // ФАКТЫ в векторную память (RAG). Без этого
-                                    // дневник остаётся пустым: консолидация только
-                                    // пережимает старые записи, новых не создаёт.
-                                    extract_facts_to_diary(llm, diary, prompts, diary_entries, cfg)
-                                        .await;
-                                }
-                                Err(e) => error!("[tg] consolidate ошибка: {}", e),
+                                last_consolidated_history_len = tg_history_full.len();
+                                // Профиль/выжимка обновились — извлекаем из них
+                                // ФАКТЫ в векторную память (RAG). Без этого
+                                // дневник остаётся пустым: консолидация только
+                                // пережимает старые записи, новых не создаёт.
+                                extract_facts_to_diary(llm, diary, prompts, diary_entries, cfg)
+                                    .await;
                             }
+                            Err(e) => error!("[tg] consolidate ошибка: {}", e),
                         }
-                        info!(
-                            "[tg] режим сна (тишина {}с >= {}с)",
-                            elapsed_any, sleep_to
-                        );
-                        let stim = serde_json::json!({
-                            "@type": "updateNewMessage",
-                            "message": {
-                                "chat_id": papik,
-                                "id": 0,
-                                "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[сон] [внутреннее] Сейчас {}:{} по времени Саши. Тишина затянулась ({} минут). Ты устала и можешь уйти дремать. Реши сама: сказать короткое «ухожу дремать / спокойной ночи» (одна часть, своими словами, без громких прощаний и без «жаль что ты молчишь») — или просто промолчать (stay_quiet). Это тихий момент, не драма.{}", local_now.hour(), local_now.minute(), elapsed_any / 60, own_recent_quotes(&tg_history_full, 2)) } }
-                            }
-                        });
-                        let before = tg_history_full.len();
-                        if quiet {
-                            // Тихие часы: он спит — «спокойной ночи» НЕ пишем,
-                            // просто засыпаем молча (консолидация выше уже сделана).
-                            info!("[tg] тихие часы — засыпаю молча, сообщение не отправляю");
-                        } else {
-                            handle_new_message(
-                                stim,
-                                llm,
-                                &client,
-                                diary,
-                                prompts,
-                                diary_entries,
-                                &mut tg_history,
-                                &mut tg_history_full,
-                                &tg_system_prompt,
-                                cfg,
-                                my_id,
-                                // is_idle=true: тесты reader-ловушек не сработают,
-                                // спящая реплика — это инициативный ход.
-                                true,
-                            )
-                            .await;
-                            if tg_history_full.len() > before {
-                                client.set_online(true);
-                            }
-                        }
-                        // Уснула: первыми больше не пишем, пока он не напишет.
-                        asleep = true;
-                        idle_pings = 0;
-                        last_activity = Instant::now();
-                        next_idle_at = Instant::now()
-                            + Duration::from_secs(idle_policy.window_max.saturating_mul(4));
-                        continue;
                     }
                     // ── Шанс написать первой ──────────────────────────────
                     // Таймер НЕ пикает «надо ответить»: он лишь даёт шанс.
@@ -3404,7 +3472,7 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": format!("[idle] [внутреннее] Сейчас {}:{} по времени Саши. Он молчит уже {} минут — это нормально, человек пишет когда хочет. Сейчас ТВОЙ ход: живая девушка иногда пишет первой просто потому, что вспомнила, улыбнулась, заметила что-то или захотела поделиться. Если у тебя есть такое живое желание — напиши первой, не молчи из вежливости. Если сейчас правда не хочется или нечего — промолчи (stay_quiet), это тоже нормально и никого не обидит.{}\n\nНЕ пиши «ты тут?», не жалуйся на тишину, не напоминай о себе пустым «я здесь» и не повторяй свои прошлые реплики. Напиши ОДНУ короткую живую реплику: про свои дела/настроение/мысль, что-то милое про него, или своё мнение о чём-то.{}{}", local_now.hour(), local_now.minute(), elapsed_any / 60, self_state_hint, own_hint, news_hint(3, 110)) } }
+                                "content": { "text": { "text": idle_stimulus_text(local_now.hour(), local_now.minute(), elapsed_any / 60, &self_state_hint, &own_hint, &news_hint(3, 110)) } }
                             }
                         });
                         let before = tg_history_full.len();
@@ -3428,14 +3496,28 @@ pub async fn run_telegram_mode(
                             idle_pings += 1;
                             last_activity = Instant::now();
                             client.set_online(true);
-                            // Следующий шанс — заметно позже: человек не пишет
-                            // «а ты тут?» сразу после своего сообщения.
-                            next_idle_at =
-                                Instant::now() + Duration::from_secs(idle_policy.next_delay(true));
                             info!(
                                 "[tg] idle: написала первой ({} без ответа)",
                                 idle_pings
                             );
+                            if idle_pings >= idle_policy.ping_max {
+                                // Серия без ответа исчерпана: НЕ вечная тишина,
+                                // а длинная пауза (~3 часа), после которой снова
+                                // будет шанс — как у живого человека.
+                                let cooldown = idle_policy.long_cooldown();
+                                idle_pings = 0;
+                                next_idle_at =
+                                    Instant::now() + Duration::from_secs(cooldown);
+                                info!(
+                                    "[tg] idle: лимит без ответа — длинная пауза {} мин",
+                                    cooldown / 60
+                                );
+                            } else {
+                                // Следующий шанс — заметно позже: человек не
+                                // пишет «а ты тут?» сразу после своего сообщения.
+                                next_idle_at = Instant::now()
+                                    + Duration::from_secs(idle_policy.next_delay(true));
+                            }
                         } else {
                             // Промолчала: активности не было, ждём дальше.
                             next_idle_at =
@@ -3812,6 +3894,34 @@ mod cliche_tests {
         ] {
             assert!(cliche_hit(t).is_some(), "не поймали клише: {t:?}");
         }
+    }
+
+    #[test]
+    fn idle_stimulus_defaults_to_writing_first() {
+        let s = idle_stimulus_text(14, 5, 3 * 24 * 60, "", "", "");
+        assert!(s.starts_with("[idle]"));
+        assert!(
+            s.contains("по умолчанию ты пишешь первой"),
+            "idle не задаёт письмо как дефолт: {s}"
+        );
+        assert!(
+            s.contains("НЕ причина молчать"),
+            "idle разрешает отговорку «он занят»: {s}"
+        );
+        assert!(
+            !s.contains("не молчи из вежливости. Если сейчас правда не хочется"),
+            "остался старый перекос в тишину: {s}"
+        );
+    }
+
+    #[test]
+    fn action_only_is_detected_but_inline_actions_are_not() {
+        assert_eq!(action_only("(тихо смеётся)"), Some("тихо смеётся"));
+        assert_eq!(action_only(" (потягивается) "), Some("потягивается"));
+        assert!(action_only("(тихо смеётся) а ты как?").is_none());
+        assert!(action_only("ну и денёк (потягивается)").is_none());
+        assert!(action_only("()").is_none());
+        assert!(action_only("просто текст").is_none());
     }
 
     #[test]

@@ -534,6 +534,64 @@ async fn idle_stay_quiet_is_silent_and_writes_no_state() {
         "на idle per-chat состояние писаться не должно"
     );
 
+    // Но сама оценка на idle ЗАПУСКАЕТСЯ и её блок инжектится в system-промпт:
+    // инициатива должна опираться на «СОСТОЯНИЕ Я / ПЛАН», а не на авось.
+    let main_reqs = f.state.main_requests();
+    assert!(!main_reqs.is_empty(), "не было запросов основного хода");
+    let sys = main_reqs[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        sys.contains(ASSESS_BLOCK_MARK),
+        "на idle оценка не инжектится в system-промпт: {sys}"
+    );
+
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+#[tokio::test]
+async fn parenthetical_action_is_glued_to_message_not_sent_alone() {
+    let f = fixture(
+        "action",
+        vec![send_tool(&[
+            "Ну и денёк сегодня выдался, если честно.",
+            "(потягивается)",
+        ])],
+        "СОСТОЯНИЕ ОН: не писал — неизвестно\nСОСТОЯНИЕ Я: сонная, но довольная\nПЛАН: рассказать про свой день",
+    )
+    .await;
+
+    let mut diary_entries = Vec::new();
+    let mut tg_history = vec![Message::system("system")];
+    let mut tg_history_full: Vec<(i64, bool, String, i64)> = Vec::new();
+
+    handle_new_message(
+        incoming("тишина"),
+        &f.llm,
+        &f.client,
+        &f.diary,
+        &f.prompts,
+        &mut diary_entries,
+        &mut tg_history,
+        &mut tg_history_full,
+        SYSTEM_PROMPT,
+        &f.cfg,
+        MY_ID,
+        true,
+    )
+    .await;
+
+    let sent = sent_messages(&f.rx);
+    assert_eq!(
+        sent.len(),
+        1,
+        "действие в скобках не должно уходить отдельным сообщением: {sent:?}"
+    );
+    assert!(
+        sent[0].contains("(потягивается)"),
+        "действие потерялось: {sent:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&f.dir);
 }
 

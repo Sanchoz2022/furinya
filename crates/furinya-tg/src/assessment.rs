@@ -155,9 +155,64 @@ pub fn build_assess_input(last_message: &str, history_tail: &str, prev_state: &s
     s
 }
 
+/// Вход оценки для ВНУТРЕННЕГО хода (idle): его сообщения нет вообще.
+///
+/// Раньше на idle оценка не запускалась, и инициативные сообщения писались
+/// без «СОСТОЯНИЕ Я / ПЛАН» — модель скатывалась в дежурные фразы. Теперь
+/// оценка честно говорит: «он не писал, состояние неизвестно», а план — что
+/// она сама хочет сказать или сделать первой.
+pub fn build_idle_assess_input(
+    local_time: &str,
+    history_tail: &str,
+    prev_state: &str,
+    self_state: &str,
+) -> String {
+    let mut s = String::new();
+    if !prev_state.trim().is_empty() {
+        s.push_str("ПРЕДЫДУЩАЯ ОЦЕНКА (для непрерывности, может быть пустой):\n");
+        s.push_str(prev_state.trim());
+        s.push_str("\n\n");
+    }
+    if !history_tail.trim().is_empty() {
+        s.push_str("НЕДАВНИЙ ЧАТ (хронологически, старые сверху):\n");
+        s.push_str(history_tail.trim());
+        s.push_str("\n\n");
+    }
+    if !self_state.trim().is_empty() {
+        s.push_str("ЕЁ СОБСТВЕННОЕ СОСТОЯНИЕ (её день, настроение, дела):\n");
+        s.push_str(self_state.trim());
+        s.push_str("\n\n");
+    }
+    s.push_str(&format!(
+        "ЭТО ВНУТРЕННИЙ ХОД (idle): его сообщения НЕТ. Он не писал, сейчас {local_time} \
+         по его времени — активные часы. Не выдумывай, что он чувствует и чем занят: \
+         он просто не писал.\n\n\
+         Верни ровно три строки: СОСТОЯНИЕ ОН:, СОСТОЯНИЕ Я:, ПЛАН:"
+    ));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_input_says_he_did_not_write() {
+        let s = build_idle_assess_input(
+            "14:05",
+            "12:00 Александр: привет",
+            "Он: устал.\nЯ: спокойна.",
+            "Сегодня доделала рисунок, хочу показать.",
+        );
+        assert!(s.contains("14:05"));
+        assert!(s.contains("его сообщения НЕТ"));
+        assert!(s.contains("доделала рисунок"), "нет её состояния: {s}");
+        assert!(s.contains("СОСТОЯНИЕ ОН:"), "нет меток: {s}");
+        assert!(
+            s.contains("Не выдумывай"),
+            "нет запрета выдумывать его состояние: {s}"
+        );
+    }
 
     #[test]
     fn parses_plain_three_lines() {

@@ -11,6 +11,10 @@
 //!   m|<unix_ts>|<текст>   — уже отправленная реплика бота (контекст)
 //!
 //! Последняя строка `u|...` — то, на что отвечаем; предыдущие — контекст.
+//!
+//! `REPLAY_IDLE=1` — прогнать ВНУТРЕННИЙ idle-ход (он не писал, у неё шанс
+//! написать первой): все строки сценария идут как контекст, текст stim-а
+//! собирается тем же `idle_stimulus_text`, что и в проде.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,7 +24,7 @@ use furinya_core::prompts::Prompts;
 use furinya_diary::{Diary, EmbeddingClient};
 use furinya_llm::{LlmClient, Message};
 use furinya_tg::TdClient;
-use furinya_tg::agent::handle_new_message;
+use furinya_tg::agent::{handle_new_message, idle_stimulus_text};
 use serde_json::{Value, json};
 
 #[tokio::main]
@@ -85,9 +89,14 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     anyhow::ensure!(!rows.is_empty(), "пустой сценарий");
 
+    let idle_turn = std::env::var("REPLAY_IDLE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
     let mut tg_history: Vec<Message> = vec![Message::system(system_prompt.clone())];
     let mut tg_history_full: Vec<(i64, bool, String, i64)> = Vec::new();
-    for (is_me, ts, text) in &rows[..rows.len() - 1] {
+    let ctx_end = if idle_turn { rows.len() } else { rows.len() - 1 };
+    for (is_me, ts, text) in &rows[..ctx_end] {
         tg_history_full.push((if *is_me { my_id } else { chat_id }, *is_me, text.clone(), *ts));
         let who = if *is_me {
             cfg.general.character_name.clone()
@@ -100,16 +109,47 @@ async fn main() -> anyhow::Result<()> {
             Message::user(format!("[{}] {}: {}", ts, who, text))
         });
     }
-    // Всё, кроме последней строки, — контекст; последняя обязана быть его.
-    let (is_me, ts, text) = rows.last().cloned().unwrap();
-    anyhow::ensure!(!is_me, "последняя строка сценария должна быть его сообщением (u|...)");
+    // Живой ход: последняя строка — его сообщение. Idle: все строки контекст,
+    // а текст стимула собираем ровно тем же кодом, что и прод.
+    let (ts, text, sender) = if idle_turn {
+        use chrono::Timelike;
+        let last_ts = rows.last().map(|r| r.1).unwrap_or(0);
+        let silent_minutes = ((chrono::Utc::now().timestamp() - last_ts).max(0) / 60) as u64;
+        let now = chrono::Local::now();
+        let self_state = std::fs::read_to_string(work.join("self_state.md")).unwrap_or_default();
+        let self_state_block = {
+            let s = self_state.trim();
+            if s.is_empty() {
+                String::new()
+            } else {
+                let cut: String = s.chars().take(800).collect();
+                format!("\n\nТвоё текущее состояние (можешь опереться на него):\n{cut}")
+            }
+        };
+        (
+            now.timestamp(),
+            idle_stimulus_text(
+                now.hour(),
+                now.minute(),
+                silent_minutes,
+                &self_state_block,
+                "",
+                "",
+            ),
+            0,
+        )
+    } else {
+        let (is_me, ts, text) = rows.last().cloned().unwrap();
+        anyhow::ensure!(!is_me, "последняя строка сценария должна быть его сообщением (u|...)");
+        (ts, text, chat_id)
+    };
 
     let incoming = json!({
         "message": {
             "chat_id": chat_id,
-            "id": 424242,
+            "id": if idle_turn { 0 } else { 424242 },
             "date": ts,
-            "sender_id": {"user_id": chat_id},
+            "sender_id": {"user_id": sender},
             "content": {
                 "@type": "messageText",
                 "text": {"@type": "formattedText", "text": text}
@@ -117,7 +157,11 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    println!("\n=== ХОД: его сообщение ===\n{text}\n");
+    if idle_turn {
+        println!("\n=== ХОД: idle (он не писал) ===\n{text}\n");
+    } else {
+        println!("\n=== ХОД: его сообщение ===\n{text}\n");
+    }
     handle_new_message(
         incoming,
         &llm,
@@ -130,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
         &system_prompt,
         &cfg,
         my_id,
-        false,
+        idle_turn,
     )
     .await;
 
