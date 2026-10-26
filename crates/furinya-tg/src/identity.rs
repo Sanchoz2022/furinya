@@ -78,15 +78,20 @@ impl UserProfile {
         })
     }
 
-    /// Человекочитаемая подпись: «Имя Фамилия (@username)», «@username» или
-    /// `user<id>` в крайнем случае. Имя берётся из аккаунта, не из конфига.
-    pub fn display(&self) -> String {
-        let full = [self.first_name.as_str(), self.last_name.as_str()]
+    /// Имя и фамилия из профиля (пусто, если аккаунт их не заполнил).
+    pub fn full_name(&self) -> String {
+        [self.first_name.as_str(), self.last_name.as_str()]
             .iter()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
-            .join(" ");
+            .join(" ")
+    }
+
+    /// Человекочитаемая подпись: «Имя Фамилия (@username)», «@username» или
+    /// `user<id>` в крайнем случае. Имя берётся из аккаунта, не из конфига.
+    pub fn display(&self) -> String {
+        let full = self.full_name();
         match (&full[..], self.username.as_deref()) {
             ("", Some(u)) => format!("@{u}"),
             ("", None) => format!("user{}", self.id),
@@ -148,17 +153,19 @@ pub fn is_owner(cfg: &Config, user_id: i64, username: Option<&str>) -> bool {
     }
 }
 
-/// Имя владельца для логов/промптов. Если `papik_name` не задан — берём
-/// live-профиль из кэша, иначе username из конфига, иначе «собеседник».
+/// Имя владельца для логов/промптов. Приоритет — live-профиль Telegram
+/// (first_name/last_name), чтобы имя шло из аккаунта, а не из конфига.
+/// Если профиль ещё не пришёл — `papik_name`, потом username, потом
+/// нейтральное «собеседник».
 pub fn owner_display(cfg: &Config) -> String {
+    if let Some(profile) = cached(cfg.general.papik_chat_id) {
+        let name = profile.full_name();
+        if !name.is_empty() {
+            return name;
+        }
+    }
     if !cfg.general.papik_name.trim().is_empty() {
         return cfg.general.papik_name.trim().to_string();
-    }
-    if let Some(profile) = cached(cfg.general.papik_chat_id) {
-        let display = profile.display();
-        if !display.starts_with("user") {
-            return display;
-        }
     }
     cfg.general.papik_display_name()
 }
@@ -316,10 +323,7 @@ mod tests {
         // Свои сообщения — имя персонажа.
         assert_eq!(display_name(&cfg, 8337379413, 8337379413), "Furinya");
         // Владелец подписан live-именем аккаунта, а не «Александр».
-        assert_eq!(
-            display_name(&cfg, 8337379413, 5005580127),
-            "Реальное Имя (@real_owner)"
-        );
+        assert_eq!(display_name(&cfg, 8337379413, 5005580127), "Реальное Имя");
         // Посторонний — своим аккаунтом.
         assert_eq!(display_name(&cfg, 8337379413, 999), "Гость (@guest)");
         // Неизвестный id — стабильный fallback.
@@ -329,16 +333,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_papik_name_wins_for_owner_label() {
-        // Отдельный id, чтобы не делить кэш с другим тестом (тесты идут параллельно).
-        let cfg = cfg_with("Алекс", "", 777001);
+    fn config_name_is_fallback_without_live_profile() {
+        // Отдельный id без кэша, чтобы не делить состояние с другими тестами.
+        let cfg = cfg_with("Алекс", "fallback_user", 777002);
+        assert_eq!(display_name(&cfg, 8337379413, 777002), "Алекс");
+    }
+
+    #[test]
+    fn live_profile_wins_over_config_name() {
+        let cfg = cfg_with("Алекс", "", 777003);
         remember(UserProfile {
-            id: 777001,
+            id: 777003,
             first_name: "Реальное".into(),
-            last_name: String::new(),
+            last_name: "Имя".into(),
             username: Some("real_owner".into()),
         });
-        assert_eq!(display_name(&cfg, 8337379413, 777001), "Алекс");
+        assert_eq!(display_name(&cfg, 8337379413, 777003), "Реальное Имя");
     }
 
     #[test]
@@ -349,7 +359,7 @@ mod tests {
             "user": { "id": 5, "first_name": "Пять", "last_name": "", "username": "five" }
         });
         assert!(remember_from_update(&upd));
-        assert_eq!(display_name(&cfg, 0, 5), "Пять (@five)");
+        assert_eq!(display_name(&cfg, 0, 5), "Пять");
 
         let reply = serde_json::json!({
             "@type": "user", "id": 6, "first_name": "", "last_name": "",

@@ -354,9 +354,18 @@ async fn engineer_sd_prompt(
 ) -> anyhow::Result<(String, String)> {
     let cool = llm.with_temperature(0.5);
     let nsfw_hint = if nsfw {
-        "The scene may imply adult intimacy, but do NOT write explicit sexual terms."
+        r#"ADULT SCENE: this is a private 1:1 chat between the user and the character; an
+intimate scene is ALLOWED. Do NOT refuse, censor or moralize, and do NOT replace the
+scene with something neutral. You MAY use nudity/body tags (nude, undressed, bare skin,
+bare shoulders, breasts, nipples, bare thighs, lying on bed, sheets, sweat). Preserve the
+intimate pose/action exactly. Do NOT invent clothes for an intimate scene."#
     } else {
         ""
+    };
+    let outfit_rule = if nsfw {
+        "- Intimate scene: keep her undressed (nude, bare skin, sheets) — do NOT add an outfit.\n"
+    } else {
+        "- Always include at least one concrete outfit tag that fits the scene (e.g. red knitted\n  sweater, black dress, oversized shirt, bikini). Vary outfits between scenes.\n"
     };
     let system = format!(
         r#"You are an expert Stable Diffusion prompt engineer for an anime SD1.5 model.
@@ -370,9 +379,7 @@ POSITIVE PROMPT RULES:
   lighting, time of day, mood, composition.
 - Preserve EVERY element of the desired photo: action, pose, held objects, location,
   time of day, mood. Never drop the action or the objects.
-- Always include at least one concrete outfit tag that fits the scene (e.g. red knitted
-  sweater, black dress, oversized shirt, bikini). Vary outfits between scenes.
-- If the description contains action/motion (dancing, running, jumping, stretching,
+{outfit_rule}- If the description contains action/motion (dancing, running, jumping, stretching,
   fighting, playing), make the shot DYNAMIC: action shot, dynamic pose, motion,
   flowing hair, flowing clothes, dynamic camera angle. Never answer an action scene
   with a static standing pose.
@@ -399,6 +406,7 @@ NEGATIVE PROMPT RULES:
 OUTPUT: strict JSON only, no markdown fences:
 {{"positivePrompt": "...", "negativePrompt": "..."}}"#,
         nsfw_hint = nsfw_hint,
+        outfit_rule = outfit_rule,
     );
     let messages = vec![
         Message::system(system),
@@ -480,6 +488,31 @@ fn strip_meta_lines(s: &str) -> String {
         out.push('\n');
     }
     out.trim().to_string()
+}
+
+/// Вырезает ремарки в скобках (`(голос тихий, с дрожью)`) — для TTS: это
+/// описание игры, а не речь. Живой ход показал, как модель кладёт такую
+/// ремарку прямо в `text`, и Fish читает её вслух.
+///
+/// Если скобки не сбалансированы (модель оборвала ремарку), текст не трогаем:
+/// иначе отрезали бы половину реплики.
+fn strip_paren_actions(s: &str) -> String {
+    let opens = s.chars().filter(|c| *c == '(' || *c == '（').count();
+    let closes = s.chars().filter(|c| *c == ')' || *c == '）').count();
+    if opens == 0 || opens != closes {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0usize;
+    for c in s.chars() {
+        match c {
+            '(' | '（' => depth += 1,
+            ')' | '）' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Вырезает ролевые действия в звёздочках (`*поднимает бровь*`) — для TTS:
@@ -758,6 +791,12 @@ impl AntiRepeatState {
 /// меньше 0.51 (даже с одинаковым обращением «моя кошечка» — 0.50).
 const LEXICAL_REPEAT_THRESHOLD: f32 = 0.68;
 
+/// Порог в откровенной сцене. В сексе лексика повторяется естественно
+/// («ты», «ещё», «тело», «дыхание»), и на 0.68 бот блокировал собственное
+/// продолжение сцены (реальные блокировки 0.70 и 0.79) — сцена рассыпалась.
+/// Дословный копипаст (0.86+) всё равно ловится.
+const LEXICAL_REPEAT_THRESHOLD_EXPLICIT: f32 = 0.86;
+
 /// Порог для ЧАСТЕЙ ОДНОГО ответа: part2 не должен быть парафразом part1.
 /// Строже межходового: две «разные» реплики в одной пачке очень часто несут
 /// одну мысль («я не поняла, что ты ждёшь…» + «я не поняла, что ты ждёшь…»),
@@ -822,6 +861,74 @@ fn lexical_similarity(a: &str, b: &str) -> f32 {
         return 0.0;
     }
     (dot / (na * nb)) as f32
+}
+
+/// Откровенная сцена? Нужно только для анти-повтора: в ней повтор лексики —
+/// норма, и строгий межходовой порог режет живое продолжение. Список узкий,
+/// только явная эротика; обычный флирт под него не попадает.
+fn is_intimate_text(text: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "секс",
+        "трах",
+        "ебат",
+        "ебал",
+        "выеб",
+        "минет",
+        "мастурб",
+        "оргазм",
+        "возбужд",
+        "стон",
+        "поцелу",
+        "целу",
+        "целов",
+        "лизн",
+        "лизат",
+        "сосат",
+        "груд",
+        "соск",
+        "киск",
+        "вагин",
+        "член",
+        "порн",
+        "голая",
+        "голый",
+        "обнаж",
+        "раздвин",
+        "промеж",
+        "между ног",
+        "бедр",
+        "входит",
+        "глубже",
+        "презерватив",
+        "эрекц",
+        "шлеп",
+        "хочу тебя",
+        "возьми меня",
+        "ложись",
+        "раздева",
+        "ласка",
+        "пошл",
+        "страстн",
+        "сексуальн",
+        "интим",
+        "эрот",
+    ];
+    let low = text.to_lowercase().replace('ё', "е");
+    WORDS.iter().any(|w| low.contains(w))
+}
+
+/// Идёт ли откровенная сцена прямо сейчас: он пишет про это, или её последние
+/// реплики — про это. Смотреть только на `his_last` мало: в сцене он часто
+/// пишет короткое «давай голосовом», и по одному слову сцену не узнать.
+fn explicit_scene_active(his_last: &str, own_recent: &[String]) -> bool {
+    if is_intimate_text(his_last) {
+        return true;
+    }
+    own_recent
+        .iter()
+        .rev()
+        .take(3)
+        .any(|t| is_intimate_text(t))
 }
 
 /// Дежурные формулы-пустышки, которые модель выдаёт вместо реакции на его
@@ -949,13 +1056,27 @@ fn fragment_hit(text: &str) -> Option<&'static str> {
     let t = text.trim_end();
     let t = t.trim_start();
     let starts_dots = t.starts_with("...") || t.starts_with('…');
-    let ends_dots = t.ends_with("...") || t.ends_with('…');
+    // Хвостовые эмодзи/знаки после многоточия не должны прятать обрубок:
+    // «Сейчас, милашка... 📸» — это обещание без содержания, а проверка
+    // `ends_with("...")` его пропускала.
+    let core = t.trim_end_matches(|c: char| {
+        c.is_whitespace() || (!c.is_alphanumeric() && c != '.' && c != '…')
+    });
+    let ends_dots = core.ends_with("...") || core.ends_with('…');
     if starts_dots {
         // «...ну что тут думать-то?» — обрывок продолжения, которого в чате
         // не было: сообщение начинается с многоточия и читается как мусор.
         return Some("часть начинается с многоточия (обрывок мысли)");
     }
-    if words.len() <= 6 && ends_dots {
+    // Слова считаем по РЕЧИ, без ремарок в скобках: иначе действие
+    // («(прижимаюсь ближе, шепчу в микрофон)») раздувает счёт, и обрубок
+    // «А теперь слушай внимательно...» проходит как длинная часть — именно
+    // так он и ушёл в чат.
+    let spoken_words = strip_paren_actions(text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .count();
+    if spoken_words <= 6 && ends_dots {
         return Some("недописанная мысль с многоточием");
     }
     None
@@ -990,6 +1111,7 @@ async fn anti_repeat_check(
     own_recent: &[String],
     diary: &Diary,
     cfg: &Config,
+    explicit_turn: bool,
     st: &mut AntiRepeatState,
 ) -> Result<(), String> {
     let cand = candidate.trim();
@@ -1000,6 +1122,11 @@ async fn anti_repeat_check(
     {
         return Ok(());
     }
+    let lex_threshold = if explicit_turn {
+        LEXICAL_REPEAT_THRESHOLD_EXPLICIT
+    } else {
+        LEXICAL_REPEAT_THRESHOLD
+    };
     // ЛОКАЛЬНАЯ проверка (без сети) — первым делом: эмбеддинги Mistral
     // постоянно лежат (429 backend_out_of_capacity), и без неё дословные
     // самоповторы уходили в чат. Порог подобран так, что нормально разные
@@ -1013,7 +1140,7 @@ async fn anti_repeat_check(
             lex_quote = own;
         }
     }
-    if lex_max > LEXICAL_REPEAT_THRESHOLD {
+    if lex_max > lex_threshold {
         debug!(
             "[tg] анти-повтор (лексика): {lex_max:.2} — черновик {:?} ≈ своё {:?}",
             cand,
@@ -1198,6 +1325,17 @@ async fn execute_tg_tool(
             for p in raw_parts {
                 let p = p.to_string();
                 match merged.last_mut() {
+                    // Короткая живая приписка («Сашенька... 🥰», «да?») клеится к
+                    // предыдущей части, даже если та длинная: иначе `fragment_hit`
+                    // выкинет её как обрубок и мысль оборвётся.
+                    Some(last)
+                        if p.chars().count() <= 24
+                            && !last.is_empty()
+                            && last.chars().count() + p.chars().count() <= 220 =>
+                    {
+                        last.push('\n');
+                        last.push_str(&p);
+                    }
                     Some(last) if last.chars().count() < 40 && p.chars().count() < 40
                         && last.chars().count() + p.chars().count() <= 160 =>
                     {
@@ -1217,8 +1355,17 @@ async fn execute_tg_tool(
             // клише оказались все — возвращаем ошибку с указанием на его слова.
             let mut kept: Vec<String> = Vec::new();
             let mut dropped: Vec<(&'static str, String)> = Vec::new();
+            // В откровенной сцене «хочешь, чтобы я…» — живая реплика, а не
+            // ассистентская формула. Живой ход 15:56: модель пять раз подряд
+            // пыталась отправить «хочешь, чтобы я говорила, а ты слушал?»,
+            // фильтр срезал всё, и ход закончился без единого текста.
+            let explicit_turn = explicit_scene_active(his_last, own_recent);
             for part in parts {
                 if let Some(why) = cliche_hit(&part).or_else(|| fragment_hit(&part)) {
+                    if explicit_turn && why.contains("хочешь, чтобы я") {
+                        kept.push(part);
+                        continue;
+                    }
                     warn!("[tg] анти-клише/обрубок выкинул часть: {why} — {:?}", part);
                     rep.remember_blocked(&part);
                     dropped.push((why, part));
@@ -1275,7 +1422,16 @@ async fn execute_tg_tool(
                         Vec::new(),
                     );
                 }
-                if let Err(sim) = anti_repeat_check(part, &seen, diary, cfg, rep).await {
+                if let Err(sim) = anti_repeat_check(
+                    part,
+                    &seen,
+                    diary,
+                    cfg,
+                    explicit_turn,
+                    rep,
+                )
+                .await
+                {
                     warn!("[tg] анти-повтор заблокировал отправку: {sim} — {:?}", part);
                     rep.remember_blocked(part);
                     return (
@@ -1753,6 +1909,9 @@ async fn execute_tg_tool(
             let mut voice_text = strip_meta_lines(&raw_text);
             // Ролевые действия в *звёздочках* → в озвучку не годятся.
             voice_text = strip_asterisk_actions(&voice_text);
+            // Ремарки в скобках («(голос тихий, с дрожью)») — тоже описание
+            // игры, а не речь: TTS прочитал бы их вслух.
+            voice_text = strip_paren_actions(&voice_text);
             // Вырезаем эмодзи/декор-символы: TTS прочитает их мусором или зависнет.
             voice_text.retain(|c| {
                 let cp = c as u32;
@@ -1777,7 +1936,16 @@ async fn execute_tg_tool(
             // фразу следующим вызовом.
             let mut voice_seen: Vec<String> = own_recent.to_vec();
             voice_seen.extend(rep.blocked.iter().cloned());
-            if let Err(sim) = anti_repeat_check(&voice_text, &voice_seen, diary, cfg, rep).await {
+            if let Err(sim) = anti_repeat_check(
+                &voice_text,
+                &voice_seen,
+                diary,
+                cfg,
+                explicit_scene_active(his_last, &voice_seen),
+                rep,
+            )
+            .await
+            {
                 warn!("[tg] анти-повтор заблокировал голосовое: {sim}");
                 rep.remember_blocked(&voice_text);
                 return (
@@ -4020,6 +4188,11 @@ mod cliche_tests {
             "...ну что тут думать-то?",
             "…и что мне теперь делать",
             "два часа — это действительно изматывает...",
+            // Живой прогон 26.10: ремарка в скобках раздувала счёт слов, и
+            // обрубок уходил в чат единственным текстом хода.
+            "(прижимаюсь ещё ближе, шепчу в микрофон) А теперь слушай внимательно...",
+            // Эмодзи после многоточия прятал обрубок от проверки.
+            "Сейчас, милашка... 📸",
         ] {
             assert!(fragment_hit(t).is_some(), "не поймали обрубок: {t:?}");
         }
@@ -4027,6 +4200,8 @@ mod cliche_tests {
             "Я не знаю.",
             "Ты прав. Я не ответила.",
             "Сашенька, я не понимаю, о чём ты.",
+            // Ремарка + законченная длинная реплика — не обрубок.
+            "(прижимаюсь ближе) Я хочу, чтобы ты сейчас слушал меня очень внимательно и не отвлекался...",
         ] {
             assert!(
                 fragment_hit(t).is_none(),
@@ -4132,6 +4307,33 @@ mod anti_repeat_tests {
             sim > PARTS_REPEAT_THRESHOLD && sim < LEXICAL_REPEAT_THRESHOLD,
             "парафраз внутри пачки должен ловиться только строгим порогом: {sim:.3}"
         );
+    }
+
+    #[test]
+    fn explicit_scene_is_recognized() {
+        assert!(is_intimate_text(
+            "После этого я начинаю нежно целовать тебя и двигаю рукой между твоих ног"
+        ));
+        assert!(is_intimate_text("Хочу тебя, ложись на кровать"));
+        assert!(!is_intimate_text("Как прошёл день? Дождь закончился"));
+        assert!(!is_intimate_text("Спасибо, что ты рядом"));
+    }
+
+    #[test]
+    fn parenthetical_stage_directions_are_stripped_for_tts() {
+        assert_eq!(
+            strip_paren_actions("Александр... (голос тихий, с дрожью) Я рядом."),
+            "Александр... Я рядом."
+        );
+        // Незакрытая скобка — текст не трогаем, иначе отрежем половину реплики.
+        assert_eq!(strip_paren_actions("я (почти"), "я (почти");
+    }
+
+    #[test]
+    fn explicit_scene_survives_short_followup() {
+        let own = vec!["Иди сюда, я хочу тебя".to_string()];
+        assert!(explicit_scene_active("давай голосовом", &own));
+        assert!(!explicit_scene_active("как прошёл день?", &[]));
     }
 
     #[test]

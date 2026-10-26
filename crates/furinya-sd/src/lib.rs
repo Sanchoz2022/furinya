@@ -440,7 +440,16 @@ pub async fn generate_image_a1111(
         render
             .loras
             .iter()
-            .map(|l| serde_json::json!({"path": l.path, "multiplier": l.multiplier}))
+            .map(|l| {
+                // NSFW: furina-LoRA мягко ослабляем (×0.87), иначе она
+                // навязывает закрытый жакет даже в откровенной сцене. Раньше
+                // это работало только для пустого списка loras.
+                let mut multiplier = l.multiplier;
+                if nsfw && l.path.to_lowercase().contains("furina") {
+                    multiplier *= 0.87;
+                }
+                serde_json::json!({"path": l.path, "multiplier": multiplier})
+            })
             .collect()
     };
 

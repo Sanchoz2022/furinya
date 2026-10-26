@@ -37,6 +37,32 @@ async fn main() -> Result<()> {
         "[furinya] конфиг: персонаж='{}', llm='{}'",
         cfg.general.character_name, cfg.general.llm.endpoint.base_url
     );
+    // Резолвнутые возможности — чтобы TOML-ошибка раздела (dotted-ключи после
+    // [[...loras]] и т.п.) не выключала голос/слух молча: видно в логе на старте.
+    info!(
+        "[furinya] возможности: фото={} ({}), голос={} ({}), слух={}, веб={}",
+        cfg.capabilities.take_photo.enabled,
+        cfg.capabilities.take_photo.backend,
+        cfg.capabilities.record_voice.enabled,
+        cfg.capabilities.record_voice.backend,
+        cfg.capabilities.hearing.enabled,
+        cfg.capabilities.web_search.enabled,
+    );
+    if cfg.capabilities.record_voice.enabled {
+        let fish_key = std::env::var("FISH_API_KEY")
+            .map(|k| !k.trim().is_empty())
+            .unwrap_or(false)
+            || !cfg.capabilities.record_voice.fish.key.trim().is_empty();
+        info!(
+            "[furinya] голос: fish referenceId={} ключ={}",
+            if cfg.capabilities.record_voice.fish.reference_id.trim().is_empty() {
+                "нет"
+            } else {
+                "есть"
+            },
+            if fish_key { "есть" } else { "НЕТ" },
+        );
+    }
 
     let prompts = Prompts::load_from_dir("prompts", &cfg)?;
     // Режим Telegram выбирается ниже (telegram_enabled + нет FURINYA_CONSOLE).

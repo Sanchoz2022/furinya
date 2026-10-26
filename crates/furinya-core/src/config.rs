@@ -447,7 +447,13 @@ pub struct SdRenderConfig {    /// Шаги. Hyper-SD 8-step: steps=8 при cfg
 }
 
 /// Одна LoRA для локального sd-server.
+///
+/// `deny_unknown_fields` — страховка от TOML-ошибки раздела: dotted-ключи,
+/// стоящие после `[[...loras]]`, попадают в последний элемент массива. Так
+/// `record_voice.enabled = true` молча оказывался полем LoRA, а голос читался
+/// выключенным. Теперь такой конфиг падает на старте, а не деградирует тихо.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SdLoraConfig {
     /// Имя файла в lora-model-dir (например "furina.safetensors").
     pub path: String,
@@ -743,6 +749,27 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn misplaced_capability_keys_fail_loudly() {
+        // Dotted-ключи после [[...loras]] TOML кладёт в последний элемент
+        // массива. Без deny_unknown_fields такой конфиг молча выключал голос.
+        let broken = r#"
+[capabilities]
+take_photo.enabled = true
+
+[[capabilities.take_photo.sd_render.loras]]
+path = "furina.safetensors"
+multiplier = 0.75
+
+record_voice.enabled = true
+"#;
+        let err = toml::from_str::<Config>(broken).expect_err("лишний ключ должен падать");
+        assert!(
+            err.to_string().contains("record_voice"),
+            "ошибка должна называть лишний ключ, а не молча его глотать: {err}"
+        );
+    }
 
     #[test]
     fn parse_existing_config() {
