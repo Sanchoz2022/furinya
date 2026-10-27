@@ -422,6 +422,18 @@ pub struct TakePhotoConfig {
     /// пересборкой. Теперь крутятся из конфига.
     #[serde(default)]
     pub sd_render: SdRenderConfig,
+    /// Проверять готовое фото зрением и при явном браке перегенерировать
+    /// с исправленным промптом. Так работал старый «плюсовой» проект: модель
+    /// смотрит на свою картинку, критикует её и правит промпт следующего кадра.
+    #[serde(default = "default_true")]
+    pub review: bool,
+    /// Сколько раз разрешено перегенерировать после критики (0 = без повтора).
+    #[serde(default = "default_review_retries")]
+    pub review_retries: u32,
+}
+
+fn default_review_retries() -> u32 {
+    1
 }
 
 /// Параметры рендера локального sd-server (stable-diffusion.cpp).

@@ -42,14 +42,23 @@ impl IdlePolicy {
 
     /// Пауза до следующего шанса предложить написать первой.
     /// `after_own_message` = мы только что сами написали → пауза длиннее.
-    pub fn next_delay(&self, after_own_message: bool) -> u64 {
+    /// `pings` = сколько своих сообщений уже осталось без ответа: чем больше,
+    /// тем реже она пишет. Человек не долбит в тишину с одинаковым интервалом —
+    /// после первого «не ответил» он пишет реже, а не чаще.
+    pub fn next_delay(&self, after_own_message: bool, pings: u32) -> u64 {
         let mut rng = rand::thread_rng();
-        if after_own_message {
+        let base = if after_own_message {
             // 2× окно: своё сообщение «съедает» интерес к диалогу.
             rng.gen_range(2 * self.window_min..=2 * self.window_max)
         } else {
             rng.gen_range(self.window_min..=self.window_max)
-        }
+        };
+        let mult = match pings {
+            0 => 1.0,
+            1 => 1.5,
+            _ => 2.5,
+        };
+        (base as f64 * mult) as u64
     }
 
     /// Можно ли сейчас предлагать шанс написать первой.
@@ -210,7 +219,7 @@ mod tests {
     fn delay_within_window() {
         let p = IdlePolicy::new(300, 900, 3);
         for _ in 0..200 {
-            let d = p.next_delay(false);
+            let d = p.next_delay(false, 0);
             assert!((300..=900).contains(&d), "задержка {d} вне окна");
         }
     }
@@ -219,9 +228,20 @@ mod tests {
     fn delay_after_own_message_is_longer() {
         let p = IdlePolicy::new(300, 900, 3);
         for _ in 0..200 {
-            let d = p.next_delay(true);
+            let d = p.next_delay(true, 0);
             assert!((600..=1800).contains(&d), "задержка {d} вне окна 2x");
         }
+    }
+
+    #[test]
+    fn delay_grows_with_unanswered_messages() {
+        // Чем больше её сообщений без ответа, тем реже следующий шанс:
+        // 1 → ×1.5, 2+ → ×2.5. Иначе она «долбит» в тишину с равным шагом.
+        let p = IdlePolicy::new(1000, 1000, 3);
+        assert_eq!(p.next_delay(false, 0), 1000);
+        assert_eq!(p.next_delay(false, 1), 1500);
+        assert_eq!(p.next_delay(false, 2), 2500);
+        assert_eq!(p.next_delay(false, 3), 2500);
     }
 
     #[test]
@@ -230,7 +250,7 @@ mod tests {
         let p = IdlePolicy::new(300, 900, 3);
         let mut uniq = std::collections::HashSet::new();
         for _ in 0..50 {
-            uniq.insert(p.next_delay(false));
+            uniq.insert(p.next_delay(false, 0));
         }
         assert!(uniq.len() > 10, "слишком мало разных задержек: {}", uniq.len());
     }

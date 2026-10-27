@@ -42,6 +42,10 @@ enabled = true
 # backends: "sd" — наш локальный sd-server; "aihorde" — облачный fallback
 backend = "sd"
 sd.baseUrl = "http://192.168.1.172:8082/"
+# Проверка готового фото зрением: критик ставит оценку и при браке (<7)
+# возвращает теги-исправления, кадр перегенерируется (review_retries раз).
+review = true
+review_retries = 1
 
 [capabilities.take_photo.aihorde]
 apikey = ""
@@ -51,6 +55,11 @@ nsfw = true
 [misc]
 idle_message_timeout_secs = 300
 sleep_timeout_secs = 900
+# Окно «шанса написать первой»: 45-120 мин тишины, после своего сообщения ×2,
+# плюс рост паузы, если он не отвечает (см. idle.rs). Не чаще ~2-3 раз в день.
+idle_window_min_secs = 2700
+idle_window_max_secs = 7200
+idle_ping_max = 2
 # Окно, когда юзер обычно спит: в это время бот не пишет первой и не будит.
 # Часы по локальному времени, 0 = выключено. Окно через полночь: 23 → 7.
 quiet_hours_start = 2

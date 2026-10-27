@@ -358,11 +358,26 @@ pub async fn news_search(query: &str, limit: usize) -> Result<Vec<NewsHeadline>>
         "https://news.google.com/rss/search?q={}&hl=ru&gl=RU&ceid=RU:ru",
         url_encode(query)
     );
-    let resp = client()?.get(&url).send().await.context("Google News RSS")?;
+    let xml = fetch_news_xml(&url).await?;
+    Ok(parse_news_feed(&xml, limit))
+}
+
+/// Главная лента Google News (топ дня, не по запросу). Именно она даёт
+/// настоящую повестку: поиск по «главные новости» приносит старьё.
+pub async fn news_top(limit: usize) -> Result<Vec<NewsHeadline>> {
+    let xml = fetch_news_xml("https://news.google.com/rss?hl=ru&gl=RU&ceid=RU:ru").await?;
+    Ok(parse_news_feed(&xml, limit))
+}
+
+async fn fetch_news_xml(url: &str) -> Result<String> {
+    let resp = client()?.get(url).send().await.context("Google News RSS")?;
     if !resp.status().is_success() {
         anyhow::bail!("Google News RSS: HTTP {}", resp.status());
     }
-    let xml = resp.text().await.context("тело RSS")?;
+    resp.text().await.context("тело RSS")
+}
+
+fn parse_news_feed(xml: &str, limit: usize) -> Vec<NewsHeadline> {
     let mut out = Vec::new();
     let mut rest = &xml[..];
     while let Some(i) = rest.find("<item>") {
@@ -376,7 +391,7 @@ pub async fn news_search(query: &str, limit: usize) -> Result<Vec<NewsHeadline>>
         }
         rest = &tail[end + 7..];
     }
-    Ok(out)
+    out
 }
 
 /// Удаляет блоки <tag>...</tag> (совместно с содержимым) без разбора DOM.
@@ -473,5 +488,21 @@ mod tests {
         assert_eq!(h.source, "Forbes.ru");
         assert_eq!(h.title, "«Дело идёт к завершению»: встреча в Петербурге");
         assert_eq!(h.date_str, "21.10 18:04"); // GMT → МСК(+3)
+    }
+
+    #[test]
+    fn news_feed_parse_limited() {
+        // Формат главной ленты Google News (без q=): те же <item>, но заголовки
+        // без « - Источник» — источник остаётся «Google News».
+        let xml = "<rss><channel>\
+            <item><title>Первая новость</title><pubDate>Tue, 27 Oct 2026 12:53:16 GMT</pubDate></item>\
+            <item><title>Вторая - Ведомости</title><pubDate>Tue, 27 Oct 2026 12:00:00 GMT</pubDate></item>\
+            </channel></rss>";
+        let list = parse_news_feed(xml, 10);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].title, "Первая новость");
+        assert_eq!(list[0].source, "Google News");
+        assert_eq!(list[1].source, "Ведомости");
+        assert_eq!(parse_news_feed(xml, 1).len(), 1, "лимит должен соблюдаться");
     }
 }

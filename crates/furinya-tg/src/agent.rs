@@ -17,9 +17,10 @@ use furinya_llm::{
     extract_thinking_from_content,
 };
 use furinya_vision::describe_photo;
+use furinya_web::NewsHeadline;
 use furinya_audio::{synthesize_speech_openai, synthesize_fish_voice, transcribe_audio};
 use furinya_sd::generate_image;
-use chrono::{Local, Timelike, Utc};
+use chrono::{Datelike, Local, Timelike, Utc};
 use rand::Rng;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
@@ -127,7 +128,9 @@ fn news_hint(max_items: usize, max_chars_each: usize) -> String {
         return String::new();
     }
     let mut s = String::from(
-        "\n[свежее из новостных каналов — если захочешь первой написать о чем-то актуальном, можешь коротко упомянуть и добавить СВОЁ мнение; не пересказывай длинно]\n",
+        "\n[свежие новости (каналы и веб) — факты о мире. Если захочешь написать первой \
+         о чём-то актуальном, возьми ОДИН заголовок и добавь СВОЁ мнение или вопрос; \
+         не пересказывай длинно и не выдумывай того, чего в заголовке нет]\n",
     );
     for it in &items {
         s.push_str(&format_news_line(it, max_chars_each));
@@ -685,13 +688,78 @@ fn own_recent_quotes(
         return String::new();
     }
     format!(
-        " Твои последние реплики: {}. НЕ повторяй их и не пиши снова «я тут, жду тебя» — \
-         это уже было. Скажи что-то НОВОЕ — или промолчи.",
+        " Твои последние реплики: {}. НЕ повторяй их, не повторяй их темы и предметы \
+         (если ты уже писала про нитки/ленты/подоконник/фото — больше про это не пиши) \
+         и не пиши снова «я тут, жду тебя». Скажи что-то НОВОЕ — или промолчи.",
         own.iter()
             .map(|s| format!("«{s}»"))
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// Настроение из `self_state.md` — одна короткая строка.
+///
+/// Полный файл — проза на 800+ символов («чем занята», «мысли»). В idle-стимул
+/// он попадал целиком, и модель слово в слово пересказывала его из хода в ход
+/// («плету нитку», «пересыпаю травы»). Берём только настроение: его хватает
+/// как отправную точку, а конкретику модель берёт из новостей и переписки.
+/// Компактная выжимка `self_state.md` для контекста хода: настроение +
+/// чем занята, без «мыслей» и литературной прозы.
+///
+/// Полный файл в 1200 символов модель пересказывала из хода в ход одними и
+/// теми же образами (нитки, подоконник, остывший чай). Короткая выжимка даёт
+/// живой материал, но не превращается в сценарий.
+pub fn self_state_brief(raw: &str) -> String {
+    let clean = raw.replace("**", "").replace('#', "");
+    let mut mood = String::new();
+    let mut busy = String::new();
+    for line in clean.lines() {
+        let l = line.trim();
+        let low = l.to_lowercase();
+        if mood.is_empty() && low.starts_with("настроение") {
+            mood = l.split_once(':').map(|(_, r)| r.trim()).unwrap_or(l).to_string();
+        } else if busy.is_empty()
+            && (low.starts_with("чем занята") || low.starts_with("занята"))
+        {
+            busy = l.split_once(':').map(|(_, r)| r.trim()).unwrap_or(l).to_string();
+        }
+    }
+    let mut out = String::new();
+    if !mood.is_empty() {
+        out.push_str(&format!("Настроение: {}\n", take_chars(&mood, 160)));
+    }
+    if !busy.is_empty() {
+        out.push_str(&format!("Чем занята: {}\n", take_chars(&busy, 200)));
+    }
+    if out.trim().is_empty() {
+        // Файл без меток — берём первые две непустые строки.
+        out = clean
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        out = take_chars(&out, 300);
+    }
+    out.trim_end().to_string()
+}
+
+pub fn self_state_mood(raw: &str) -> String {
+    let clean = raw.replace("**", "").replace('#', "");
+    let mut line = clean
+        .lines()
+        .map(|l| l.trim().to_string())
+        .find(|l| l.to_lowercase().starts_with("настроение"))
+        .unwrap_or_default();
+    if line.is_empty() {
+        line = clean.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("").to_string();
+    }
+    if let Some((_, rest)) = line.split_once(':') {
+        line = rest.trim().to_string();
+    }
+    take_chars(line.trim_matches('*').trim(), 200)
 }
 
 /// Обрезает строку по символам (без разрыва UTF-8).
@@ -1356,6 +1424,107 @@ async fn anti_repeat_check(
 ///   [фото: …]) — для записи в живую память (record_my_send).
 #[allow(clippy::ptr_arg)]
 #[allow(clippy::too_many_arguments)]
+/// Промпт критика: та же модель-вижн смотрит на свой же кадр.
+///
+/// Формат ответа строгий, чтобы можно было разобрать его без догадок:
+/// первая строка — оценка, вторая — английские теги правок для промпта.
+const PHOTO_CRITIQUE_PROMPT: &str = "\
+Ты художник, который проверяет свой готовый кадр ПЕРЕД отправкой. \
+Оцени его строго по видимым дефектам: лицо и глаза, руки/пальцы, анатомия, \
+поза, одежда, фон, общая привлекательность. Если дефектов нет — оценка высокая. \
+Ответь РОВНО двумя строками, без пояснений:\n\
+ОЦЕНКА: <число 0-10>\n\
+ИСПРАВИТЬ: <короткий список английских тегов (danbooru-style) через запятую, \
+которые надо ДОБАВИТЬ в промпт, чтобы исправить дефекты; или «нет»>";
+
+/// Проверка готового фото зрением. Возвращает теги-исправления, если критик
+/// поставил низкую оценку и назвал, что править.
+async fn review_generated_image(cfg: &Config, path: &std::path::Path) -> Option<String> {
+    let vcfg = &cfg.capabilities.vision;
+    let vllm = LlmClient::new(
+        &vcfg.llm_image_to_text.base_url,
+        &vcfg.llm_image_to_text.bearer_key,
+        &vcfg.llm_image_to_text.model,
+        furinya_llm::SamplingParams {
+            temperature: 0.2,
+            top_p: None,
+            top_k: None,
+            min_p: cfg.misc.llm_min_p.parse().ok(),
+            presence_penalty: None,
+            repetition_penalty: None,
+        },
+    );
+    let p = path.to_string_lossy().to_string();
+    let call = describe_photo(&vllm, vcfg, &p, PHOTO_CRITIQUE_PROMPT);
+    let critique = match tokio::time::timeout(Duration::from_secs(60), call).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            warn!("[tg] критик фото: {e}");
+            return None;
+        }
+        Err(_) => {
+            warn!("[tg] критик фото: таймаут 60с");
+            return None;
+        }
+    };
+    info!("[tg] критик фото: {}", critique.replace('\n', " | "));
+    parse_photo_critique(&critique)
+}
+
+/// Разбор ответа критика: `ОЦЕНКА: N` + `ИСПРАВИТЬ: теги`.
+/// Повторяем кадр, если оценка ниже 7 ИЛИ критик назвал серьёзный дефект
+/// (руки/анатомия/артефакты): даже при общей «8» такие вещи видно сразу,
+/// и именно из-за них фото выглядит сырым.
+fn parse_photo_critique(text: &str) -> Option<String> {
+    let mut score: i32 = 10;
+    let mut fixes = String::new();
+    for line in text.lines() {
+        let l = line.trim().trim_start_matches(|c: char| c == '*' || c == '-' || c == ' ');
+        let low = l.to_lowercase();
+        if low.starts_with("оценка") {
+            let digits: String = low.chars().filter(|c| c.is_ascii_digit()).collect();
+            if let Ok(v) = digits.parse::<i32>() {
+                score = v;
+            }
+        } else if low.starts_with("исправить") {
+            if let Some((_, rest)) = l.split_once(':') {
+                fixes = rest.trim().to_string();
+            }
+        }
+    }
+    let fixes_low = fixes.to_lowercase().replace('_', " ");
+    if fixes.is_empty() || fixes_low.starts_with("нет") || fixes_low == "-" {
+        return None;
+    }
+    const SEVERE: &[&str] = &[
+        "extra finger",
+        "missing finger",
+        "fused finger",
+        "bad hands",
+        "bad hand",
+        "extra hand",
+        "extra arm",
+        "extra leg",
+        "extra limb",
+        "deformed",
+        "mutated",
+        "malformed",
+        "distorted",
+        "duplicate",
+        "third arm",
+        "two tails",
+        "extra tail",
+        "no eyes",
+        "asymmetric eyes",
+        "both eyes same",
+    ];
+    let severe = SEVERE.iter().any(|m| fixes_low.contains(m));
+    if score >= 7 && !severe {
+        return None;
+    }
+    Some(fixes.chars().take(300).collect())
+}
+
 async fn execute_tg_tool(
     name: &str,
     args: &str,
@@ -2008,34 +2177,55 @@ async fn execute_tg_tool(
             } else {
                 DEFAULT_SD_NEGATIVE.to_string()
             };
-            // Куда сохраняем сгенерированный PNG.
+            // Генерация + проверка зрением (как в старом «плюсовом» проекте):
+            // модель смотрит на свою же картинку, критикует её, и правка уходит
+            // в промпт следующего кадра. Один кадр → критик → при явном браке
+            // одна перегенерация с исправлениями.
             let out_dir = std::env::temp_dir();
-            let fname = format!(
-                "furinya_gen_{}.png",
-                Utc::now().format("%Y%m%d_%H%M%S")
-            );
-            let out_path = out_dir.join(&fname);
-            info!(
-                "[tg] generate_image: positive={:?} negative={:?} → бэкенд {} (nsfw={nsfw})",
-                positive, negative_prompt, cfg.capabilities.take_photo.backend
-            );
-            client.send_action_typing(chat_id);
-            match generate_image(
-                &cfg.capabilities.take_photo,
-                &positive,
-                &negative_prompt,
-                nsfw,
-                &out_path,
-            )
-            .await
-            {
+            let tp = &cfg.capabilities.take_photo;
+            let review = tp.review && cfg.capabilities.vision.enabled && tp.review_retries > 0;
+            let mut pos = positive.clone();
+            let neg = negative_prompt.clone();
+            let mut attempt: u32 = 0;
+            let generated = loop {
+                let fname = format!(
+                    "furinya_gen_{}.png",
+                    Utc::now().format("%Y%m%d_%H%M%S%3f")
+                );
+                let out_path = out_dir.join(&fname);
+                info!(
+                    "[tg] generate_image: попытка {} positive={:?} negative={:?} → бэкенд {} (nsfw={nsfw})",
+                    attempt + 1,
+                    pos,
+                    neg,
+                    tp.backend
+                );
+                client.send_action_typing(chat_id);
+                match generate_image(tp, &pos, &neg, nsfw, &out_path).await {
+                    Ok(path) => {
+                        if !review || attempt >= tp.review_retries {
+                            break Ok(path);
+                        }
+                        match review_generated_image(cfg, std::path::Path::new(&path)).await {
+                            Some(fix) => {
+                                warn!("[tg] generate_image: критик просит правки: {fix}");
+                                pos = dedupe_exact_tags(&format!("{pos}, {fix}"));
+                                attempt += 1;
+                            }
+                            None => break Ok(path),
+                        }
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            match generated {
                 Ok(path) => {
                     // Отправляем картинку в чат.
                     client.send_photo(chat_id, &path);
-                    info!("[tg] generate_image: отправлено фото {}", path);
+                    info!("[tg] generate_image: отправлено фото {} (попыток: {})", path, attempt + 1);
                     (
                         format!("Изображение сгенерировано и отправлено: {path}"),
-                        vec![format!("[я отправила ФОТО (промпт): {positive}]")],
+                        vec![format!("[я отправила ФОТО (промпт): {pos}]")],
                     )
                 }
                 Err(e) => {
@@ -2206,24 +2396,28 @@ pub fn idle_stimulus_text(
     own_hint: &str,
     news_block: &str,
 ) -> String {
+    let news_rule = if news_block.trim().is_empty() {
+        ""
+    } else {
+        "\n\nВ блоке новостей ниже — РЕАЛЬНЫЕ свежие заголовки (Россия и Нижний Новгород). \
+         Если хоть один тебя правда зацепил — возьми РОВНО ОДИН и отреагируй по-своему: \
+         своё мнение, эмоция, вопрос ему. Не пересказывай новость, не выдумывай деталей, \
+         которых в заголовке нет, и не вываливай политику без повода."
+    };
     format!(
         "[idle] [внутреннее] Сейчас {hour}:{minute:02} — активные часы. \
          Он не писал {silent_minutes} минут; это нормально, у него своя жизнь и он не \
          обязан отвечать сразу. Сейчас ТВОЙ черёд, и по умолчанию ты пишешь первой: \
-         живая девушка не ждёт разрешения и не молчит из вежливости — она вспоминает, \
-         замечает, хочет поделиться. Молчи (stay_quiet) только если у тебя правда нет \
-         ни одной живой мысли, дела или настроения, которым хочется поделиться. \
-         «Он, наверное, занят/спит» — НЕ причина молчать: если занят, он просто \
-         ответит позже.{self_state_block} \n\n\
-         Опирайся на своё состояние и свои дела: скажи что-то КОНКРЕТНОЕ из своей \
-         жизни, мыслей или настроения, а не дежурное «я тут». Пиши как СМС, а не как \
-         описание сцены: что ты чувствуешь, что подумала, чего хочешь — и хотя бы \
-         одной мыслью свяжи это с ним (что бы ты ему сказала, что вспомнила о нём, \
-         чего ждёшь). Не описывай предметы и свет — это читается как проза, а не как \
-         живое сообщение. НЕ пиши «ты тут?», не жалуйся на тишину, не напоминай о \
-         себе пустым «я здесь» и не повторяй свои прошлые реплики. Напиши ОДНУ \
-         короткую живую реплику — можно с действием в скобках, например \
-         (потягивается) или (тихо смеётся), если оно правда уместно.{own_hint}{news_block}"
+         живая девушка не ждёт разрешения и не молчит из вежливости.{self_state_block}\
+         {news_rule}\n\n\
+         Опирайся ТОЛЬКО на три вещи: своё настроение, свежие новости (если они есть) и \
+         то, что уже было в вашей переписке. НЕ выдумывай новые предметы и сцены, которых \
+         в переписке не было: никаких «плету нитку», «пересыпаю травы», «сижу на \
+         подоконнике», если этого не было в разговоре. Не описывай предметы и свет — это \
+         проза, а не СМС. Скажи одну живую мысль или эмоцию и хотя бы одной мыслью свяжи \
+         её с ним. НЕ пиши «ты тут?», не жалуйся на тишину, не напоминай о себе пустым \
+         «я здесь».{own_hint} Напиши ОДНУ короткую живую реплику — можно с действием в \
+         скобках, например (потягивается) или (тихо смеётся), если оно правда уместно.{news_block}"
     )
 }
 
@@ -2689,15 +2883,14 @@ pub async fn handle_new_message(
                 }
             }
 
-            // Её СОБСТВЕННОЕ состояние (data/diary/self_state.md): настроение,
-            // чем занята, мысли. Это Я, НЕ пользователь — даёт живой материал,
-            // чтобы писать первой своё, а не дежурное «ты тут?».
+            // Её СОБСТВЕННОЕ состояние (data/diary/self_state.md): настроение и
+            // чем занята — КОРОТКО. Полный файл (1200 символов прозы про нитки
+            // и подоконник) модель пересказывала слово в слово из хода в ход.
             let self_state_path = std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md");
             if let Ok(self_state) = std::fs::read_to_string(&self_state_path) {
                 let self_state = furinya_diary::consolidate::sanitize_self_state(&self_state);
-                let self_state = self_state.trim();
-                if !self_state.is_empty() {
-                    let block = take_chars(self_state, 1200);
+                let block = self_state_brief(&self_state);
+                if !block.is_empty() {
                     injected_chars += block.chars().count();
                     messages.push(Message::user(format!(
                         "Моё текущее состояние (это Я, не пользователь):\n{block}"
@@ -3354,6 +3547,92 @@ async fn setup_news_channels(client: &TdClient, cfg: &Config) {
 }
 
 /// Один проход опроса: getChatHistory по каждому каналу, тексты → в кэш.
+/// Веб-новости в тот же кэш: Google News RSS по стране и городу.
+///
+/// Зачем: телеграм-каналы дают 1–2 темы в час, и модель скатывается в свои
+/// выдуманные истории («нитки», «подоконник»). RSS добавляет настоящую
+/// повестку дня — есть о чём написать первой, не сочиняя.
+/// Идентификаторы отрицательные, чтобы не пересекаться с chat_id каналов.
+async fn poll_web_news_once() {
+    const CITY_QUERY: &str = "Нижний Новгород";
+    // Свежесть: в топе Google News висят и вчерашние материалы — берём
+    // только то, что моложе 12 часов, иначе «новости» будут с бородой.
+    let cutoff = Utc::now().timestamp() - 12 * 3600;
+
+    let feeds: [(i64, &str, Vec<NewsHeadline>); 2] = [
+        (
+            -1,
+            "Веб-новости",
+            match furinya_web::news_top(10).await {
+                Ok(list) => list,
+                Err(e) => {
+                    debug!("[news] Веб-новости: RSS недоступен ({e})");
+                    Vec::new()
+                }
+            },
+        ),
+        (
+            -2,
+            "Веб-новости НН",
+            match furinya_web::news_search(CITY_QUERY, 8).await {
+                Ok(list) => list,
+                Err(e) => {
+                    debug!("[news] Веб-новости НН: RSS недоступен ({e})");
+                    Vec::new()
+                }
+            },
+        ),
+    ];
+    for (chat_id, title, list) in feeds {
+        for h in &list {
+            let Some(ts) = parse_news_date(&h.date_str) else {
+                continue;
+            };
+            if ts < cutoff {
+                continue;
+            }
+            let text = if h.source.is_empty() {
+                h.title.clone()
+            } else {
+                format!("{} ({})", h.title, h.source)
+            };
+            push_news(NewsItem {
+                chat_id,
+                chat_title: title.to_string(),
+                message_id: news_fake_id(&h.title),
+                ts,
+                text,
+            });
+        }
+        info!("[news] {title}: {} заголовков (RSS)", list.len());
+    }
+}
+
+/// «27.10 15:04» → unix-время (текущий год, локальная зона). None, если формат не тот.
+fn parse_news_date(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let year = Local::now().year();
+    let naive = chrono::NaiveDateTime::parse_from_str(&format!("{year} {s}"), "%Y %d.%m %H:%M").ok()?;
+    naive
+        .and_local_timezone(Local)
+        .single()
+        .map(|dt| dt.timestamp())
+}
+
+/// Стабильный «message_id» для новости из RSS: один и тот же заголовок не
+/// должен дублироваться на каждом опросе.
+fn news_fake_id(title: &str) -> i64 {
+    let mut h: i64 = 0xcbf29ce484222325u64 as i64;
+    for b in title.bytes() {
+        h ^= b as i64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 async fn poll_news_once(client: &TdClient, limit_per_channel: i64) {
     let channels: Vec<(i64, String)> = {
         let map = NEWS_CHANNELS.lock().unwrap();
@@ -3498,12 +3777,17 @@ pub async fn run_telegram_mode(
             // После логина TDLib может ещё дожёвывать готовность — даём время.
             tokio::time::sleep(Duration::from_secs(10)).await;
             poll_news_once(&news_client, 20).await;
+            poll_web_news_once().await;
             info!("[news] первичный опрос каналов выполнен");
             let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs.max(60)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Первый тик interval отдаёт сразу — он уже отработан выше,
+            // второй опрос подряд не нужен.
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 poll_news_once(&news_client, 15).await;
+                poll_web_news_once().await;
             }
         });
         info!(
@@ -3540,7 +3824,8 @@ pub async fn run_telegram_mode(
     // next_idle_at — момент, когда можно ПРЕДЛОЖИТЬ ей написать первой.
     // Дальше решает модель: пишет или зовёт stay_quiet (молчит). Окно
     // каждый раз случайное — чтобы не выходило «ровно как по часам».
-    let mut next_idle_at = Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+    let mut next_idle_at =
+        Instant::now() + Duration::from_secs(idle_policy.next_delay(false, 0));
     // Сколько своих инициативных сообщений подряд можно оставить без ответа.
     let mut idle_pings: u32 = 0;
     // Уснула: пока первыми не пишем (проснётся на его сообщение).
@@ -3844,8 +4129,8 @@ pub async fn run_telegram_mode(
                             info!("[tg] тихие часы кончились ({}:00) — проснулась", local_hour);
                             asleep = false;
                             idle_pings = 0;
-                            next_idle_at =
-                                Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+                            next_idle_at = Instant::now()
+                                + Duration::from_secs(idle_policy.next_delay(false, 0));
                         }
                         crate::idle::QuietEvent::None => {}
                     }
@@ -3912,21 +4197,17 @@ pub async fn run_telegram_mode(
                         );
                         // Её собственные последние реплики — иначе модель повторяет
                         // одну и ту же строчку («я тут, жду тебя») из хода в ход.
-                        let own_hint = own_recent_quotes(&tg_history_full, 3);
-                        // Её собственное состояние — чтобы было ЧТО рассказать
-                        // (настроение, чем занята), а не дежурное «я тут».
+                        let own_hint = own_recent_quotes(&tg_history_full, 4);
+                        // Её собственное состояние — но ТОЛЬКО настроение одной
+                        // строкой: полный файл (проза про нитки и подоконник)
+                        // модель пересказывала из хода в ход.
                         let self_state_hint = std::fs::read_to_string(
                             std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md"),
                         )
                         .ok()
-                        .map(|s| {
-                            let s = s.trim();
-                            if s.is_empty() {
-                                String::new()
-                            } else {
-                                format!("\n\nТвоё текущее состояние (можешь опереться на него):\n{}", take_chars(s, 800))
-                            }
-                        })
+                        .map(|s| self_state_mood(&s))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\n\nТвоё настроение сейчас: {s}"))
                         .unwrap_or_default();
                         let stim = serde_json::json!({
                             "@type": "updateNewMessage",
@@ -3934,7 +4215,7 @@ pub async fn run_telegram_mode(
                                 "chat_id": papik,
                                 "id": 0,
                                 "sender_id": { "user_id": 0 },
-                                "content": { "text": { "text": idle_stimulus_text(local_now.hour(), local_now.minute(), elapsed_any / 60, &self_state_hint, &own_hint, &news_hint(3, 110)) } }
+                                "content": { "text": { "text": idle_stimulus_text(local_now.hour(), local_now.minute(), elapsed_any / 60, &self_state_hint, &own_hint, &news_hint(4, 120)) } }
                             }
                         });
                         let before = tg_history_full.len();
@@ -3978,12 +4259,12 @@ pub async fn run_telegram_mode(
                                 // Следующий шанс — заметно позже: человек не
                                 // пишет «а ты тут?» сразу после своего сообщения.
                                 next_idle_at = Instant::now()
-                                    + Duration::from_secs(idle_policy.next_delay(true));
+                                    + Duration::from_secs(idle_policy.next_delay(true, idle_pings));
                             }
                         } else {
                             // Промолчала: активности не было, ждём дальше.
-                            next_idle_at =
-                                Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+                            next_idle_at = Instant::now()
+                                + Duration::from_secs(idle_policy.next_delay(false, idle_pings));
                             info!("[tg] idle: промолчала — следующий шанс позже");
                         }
                     }
@@ -4021,7 +4302,8 @@ pub async fn run_telegram_mode(
                 idle_pings = 0;
                 consolidated = false;
                 // Следующий шанс написать первой — снова случайный.
-                next_idle_at = Instant::now() + Duration::from_secs(idle_policy.next_delay(false));
+                next_idle_at =
+                    Instant::now() + Duration::from_secs(idle_policy.next_delay(false, 0));
             }
         }
         let t = v.get("@type").and_then(|x| x.as_str()).unwrap_or("");
@@ -4395,17 +4677,92 @@ mod cliche_tests {
             "idle не задаёт письмо как дефолт: {s}"
         );
         assert!(
-            s.contains("НЕ причина молчать"),
-            "idle разрешает отговорку «он занят»: {s}"
+            s.contains("это нормально"),
+            "idle не снимает вину за его тишину: {s}"
         );
         assert!(
             !s.contains("не молчи из вежливости. Если сейчас правда не хочется"),
             "остался старый перекос в тишину: {s}"
         );
         assert!(
-            s.contains("Пиши как СМС, а не как описание сцены"),
+            s.contains("проза, а не СМС"),
             "idle не требует живой реплики вместо прозы: {s}"
         );
+        assert!(
+            s.contains("НЕ выдумывай новые предметы"),
+            "idle разрешает выдумывать себе занятия: {s}"
+        );
+    }
+
+    #[test]
+    fn idle_stimulus_uses_news_and_forbids_repeats() {
+        let s = idle_stimulus_text(14, 5, 90, "", " НЕ повторяй.", "\n— [Mash]: что-то");
+        assert!(s.contains("возьми РОВНО ОДИН"), "нет правила про новости: {s}");
+        assert!(s.contains("Mash"), "новости не попали в стимул: {s}");
+        // Без новостей правило про них не появляется: нечего упоминать.
+        let empty = idle_stimulus_text(14, 5, 90, "", "", "");
+        assert!(!empty.contains("возьми РОВНО ОДИН"));
+    }
+
+    #[test]
+    fn self_state_mood_takes_only_the_mood_line() {
+        let raw = "# Моё состояние\n\n**Настроение:** тепло и лениво, чай в руках.\n\n\
+                   **Чем занята:** плету нитку и пересыпаю травы.\n";
+        let mood = self_state_mood(raw);
+        assert_eq!(mood, "тепло и лениво, чай в руках.");
+        // Проза про занятия в idle больше не попадает.
+        assert!(!mood.contains("нитку"));
+        assert!(self_state_mood("").is_empty());
+    }
+
+    #[test]
+    fn self_state_brief_is_compact() {
+        let raw = "# Моё состояние\n\n**Настроение:** тепло и лениво, чай в руках.\n\n\
+                   **Чем занята:** плету нитку и пересыпаю травы.\n\n\
+                   **Мысли:** сегодня особенно приятно думать о том, как свет падает на нитки.";
+        let brief = self_state_brief(raw);
+        assert!(brief.contains("Настроение: тепло и лениво"));
+        assert!(brief.contains("Чем занята: плету нитку"));
+        // «Мысли» — та самая проза, которую она парротила; в контекст не идут.
+        assert!(!brief.contains("Мысли"));
+        assert!(!brief.contains("свет падает"));
+        assert!(brief.chars().count() < 400);
+        assert!(self_state_brief("").is_empty());
+    }
+
+    #[test]
+    fn photo_critique_parsing() {
+        let bad = "ОЦЕНКА: 4\nИСПРАВИТЬ: bad hands, extra fingers, blurry face";
+        assert_eq!(
+            parse_photo_critique(bad).as_deref(),
+            Some("bad hands, extra fingers, blurry face")
+        );
+        // Хорошая оценка — правок нет, кадр отправляется как есть.
+        assert!(parse_photo_critique("ОЦЕНКА: 9\nИСПРАВИТЬ: нет").is_none());
+        // Низкая оценка, но править нечего.
+        assert!(parse_photo_critique("ОЦЕНКА: 5\nИСПРАВИТЬ: нет").is_none());
+        // Модель ответила не по формату — не выдумываем правки.
+        assert!(parse_photo_critique("выглядит неплохо").is_none());
+        // Даже при общей «8» серьёзный дефект (пальцы) — повод перегенерировать.
+        let hands = "ОЦЕНКА: 8\nИСПРАВИТЬ: extra_fingers, slightly_asymmetrical_ears";
+        assert!(parse_photo_critique(hands).is_some());
+        // Косметика без анатомии на «8» — кадр отправляем как есть.
+        let cosmetic = "ОЦЕНКА: 8\nИСПРАВИТЬ: more_realistic_skin_texture, subtle_shadows";
+        assert!(parse_photo_critique(cosmetic).is_none());
+    }
+
+    #[test]
+    fn news_date_is_parsed_in_current_year() {
+        let ts = parse_news_date("27.10 15:04").expect("дата должна разобраться");
+        use chrono::{Datelike, TimeZone, Timelike};
+        let dt = chrono::Local.timestamp_opt(ts, 0).single().unwrap();
+        assert_eq!(dt.day(), 27);
+        assert_eq!(dt.month(), 10);
+        assert_eq!(dt.hour(), 15);
+        assert_eq!(dt.minute(), 4);
+        assert_eq!(dt.year(), chrono::Local::now().year());
+        assert!(parse_news_date("").is_none());
+        assert!(parse_news_date("вчера").is_none());
     }
 
     #[test]

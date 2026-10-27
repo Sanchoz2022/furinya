@@ -24,7 +24,7 @@ use furinya_core::prompts::Prompts;
 use furinya_diary::{Diary, EmbeddingClient};
 use furinya_llm::{LlmClient, Message};
 use furinya_tg::TdClient;
-use furinya_tg::agent::{handle_new_message, idle_stimulus_text};
+use furinya_tg::agent::{handle_new_message, idle_stimulus_text, self_state_mood};
 use serde_json::{Value, json};
 
 #[tokio::main]
@@ -116,16 +116,23 @@ async fn main() -> anyhow::Result<()> {
         let last_ts = rows.last().map(|r| r.1).unwrap_or(0);
         let silent_minutes = ((chrono::Utc::now().timestamp() - last_ts).max(0) / 60) as u64;
         let now = chrono::Local::now();
+        // Как в проде: только настроение одной строкой, без прозы про занятия.
         let self_state = std::fs::read_to_string(work.join("self_state.md")).unwrap_or_default();
-        let self_state_block = {
-            let s = self_state.trim();
-            if s.is_empty() {
-                String::new()
-            } else {
-                let cut: String = s.chars().take(800).collect();
-                format!("\n\nТвоё текущее состояние (можешь опереться на него):\n{cut}")
-            }
+        let mood = self_state_mood(&self_state);
+        let self_state_block = if mood.is_empty() {
+            String::new()
+        } else {
+            format!("\n\nТвоё настроение сейчас: {mood}")
         };
+        // Новости в replay: файл с готовыми строками (кэш каналов живёт в
+        // проде, здесь его нет). Формат — как у news_hint: «— [источник]: текст».
+        let news_block = std::env::var("REPLAY_NEWS_FILE")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("\n{t}"))
+            .unwrap_or_default();
         (
             now.timestamp(),
             idle_stimulus_text(
@@ -134,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
                 silent_minutes,
                 &self_state_block,
                 "",
-                "",
+                &news_block,
             ),
             0,
         )
