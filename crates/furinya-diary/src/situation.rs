@@ -27,7 +27,7 @@ use furinya_core::prompts::Prompts;
 use furinya_llm::{LlmClient, Message, MessageContent};
 use tracing::{info, warn};
 
-use crate::cosine_similarity;
+use crate::diary::{CENTER_MIN_ENTRIES, centered_cosine, corpus_mean};
 use crate::embedding::EmbeddingClient;
 
 /// Одна ситуационная заметка — атомарный блок одного обмена.
@@ -264,6 +264,14 @@ impl SituationStore {
         if scored.is_empty() {
             return String::new();
         }
+        // Центрированный косинус: у mistral-embed сырое сходство заметок
+        // почти не различается (общий «фон» ~0.9). Вычитаем средний вектор
+        // корпуса. На маленьком индексе центрирование нестабильно — обычный.
+        let mean = if scored.len() >= CENTER_MIN_ENTRIES {
+            corpus_mean(scored.iter().map(|n| n.embedding.as_slice()))
+        } else {
+            Vec::new()
+        };
         let qv = match embedder.embed(query).await {
             Ok(v) => v,
             Err(e) => {
@@ -273,7 +281,7 @@ impl SituationStore {
         };
         let mut hits: Vec<(f32, &SituationNote)> = scored
             .into_iter()
-            .map(|n| (cosine_similarity(&qv, &n.embedding), n))
+            .map(|n| (centered_cosine(&qv, &n.embedding, &mean), n))
             .collect();
         hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(k);
@@ -305,18 +313,17 @@ impl SituationStore {
         }
         let notes = self.parse_md();
         let n = notes.iter().map(|x| x.n).max().unwrap_or(0) + 1;
-        let prev = notes
-            .last()
-            .map(|x| x.block())
-            .unwrap_or_else(|| "<пусто>".to_string());
         let now = chrono::Local::now();
         let header = format!("{} №{}", now.format("[%d.%m %H:%M]"), n);
 
+        // Предыдущую заметку НЕ передаём. Модель принимала её за факты и
+        // переносила в новую («он ответил спасибо на мою фантазию о…»), хотя
+        // в обмене этого не было. Заметка атомарна: обмен — единственный вход.
         let input = format!(
-            "ПРЕДЫДУЩАЯ ЗАМЕТКА (для непрерывности, может быть пустой):\n{}\n\n---\n\n\
-             НОВЫЙ ОБМЕН (один чат, хронологически, старые сверху, формат [ДД.ММ ЧЧ:ММ] Имя: текст):\n{}\n\n\
+            "НОВЫЙ ОБМЕН (единственный источник фактов; один чат, хронологически, \
+             старые сверху, формат [ДД.ММ ЧЧ:ММ] Имя: текст):\n{}\n\n\
              Верни ТОЛЬКО заметку по формату (без нумерации и без заголовка с датой).",
-            prev, exchange
+            exchange
         );
         let resp = llm
             .chat(vec![Message::system(system), Message::user(input)], None)

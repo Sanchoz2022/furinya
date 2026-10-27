@@ -62,6 +62,10 @@ fn default_last_used() -> String {
     "never".to_string()
 }
 
+/// Минимум записей, при котором центрированный косинус устойчив. На меньшем
+/// корпусе средний вектор почти совпадает с самими записями и «съедает» сигнал.
+pub const CENTER_MIN_ENTRIES: usize = 5;
+
 /// Запись дневника: идентификатор (имя файла без .md) + метаданные + тело.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -75,6 +79,79 @@ pub struct Entry {
 pub struct QueryHit {
     pub entry: Entry,
     pub relatedness: f32,
+}
+
+/// Средний вектор корпуса. Пустой вектор, если на входе ничего нет.
+///
+/// Нужен для центрированного косинуса: у `mistral-embed` все векторы лежат в
+/// узком конусе (попарный косинус несвязанных русских текстов p50 ≈ 0.885),
+/// поэтому сырое сходство не различает релевантное и мусор. Вычитание среднего
+/// убирает общую «фонему» и оставляет именно тематическую разницу.
+pub fn corpus_mean<'a, I>(vectors: I) -> Vec<f32>
+where
+    I: IntoIterator<Item = &'a [f32]>,
+{
+    let mut mean: Vec<f32> = Vec::new();
+    let mut count = 0usize;
+    for v in vectors {
+        if v.is_empty() {
+            continue;
+        }
+        if mean.is_empty() {
+            mean = vec![0.0; v.len()];
+        } else if mean.len() != v.len() {
+            // Разные пространства в одном корпусе — не смешиваем: центрирование
+            // по такому «среднему» даст мусор. Пусть вызывающий решает.
+            continue;
+        }
+        for (m, x) in mean.iter_mut().zip(v) {
+            *m += *x;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+    let inv = 1.0 / count as f32;
+    for m in &mut mean {
+        *m *= inv;
+    }
+    mean
+}
+
+/// Косинус ДВУХ ЦЕНТРИРОВАННЫХ векторов: `cos(a - mean, b - mean)`.
+///
+/// Считается без аллокаций через скалярные произведения:
+///   cov = a·b - a·m - b·m + m·m
+///   |a-m|² = a·a - 2(a·m) + m·m
+/// Пустой `mean` (маленький корпус) — обычный косинус.
+pub fn centered_cosine(a: &[f32], b: &[f32], mean: &[f32]) -> f32 {
+    if mean.is_empty() || mean.len() != a.len() || mean.len() != b.len() {
+        return cosine_similarity(a, b);
+    }
+    let mut dot_ab = 0.0f32;
+    let mut dot_am = 0.0f32;
+    let mut dot_bm = 0.0f32;
+    let mut dot_mm = 0.0f32;
+    let mut dot_aa = 0.0f32;
+    let mut dot_bb = 0.0f32;
+    for i in 0..a.len() {
+        let (x, y, m) = (a[i], b[i], mean[i]);
+        dot_ab += x * y;
+        dot_am += x * m;
+        dot_bm += y * m;
+        dot_mm += m * m;
+        dot_aa += x * x;
+        dot_bb += y * y;
+    }
+    let cov = dot_ab - dot_am - dot_bm + dot_mm;
+    let va = (dot_aa - 2.0 * dot_am + dot_mm).max(0.0);
+    let vb = (dot_bb - 2.0 * dot_bm + dot_mm).max(0.0);
+    if va <= f32::EPSILON || vb <= f32::EPSILON {
+        0.0
+    } else {
+        cov / (va.sqrt() * vb.sqrt())
+    }
 }
 
 /// Косинусное сходство двух векторов.
@@ -288,16 +365,30 @@ impl Diary {
     }
 
     /// Возвращает отсортированные по relatedness (по убыванию) хиты выше порога.
+    ///
+    /// Сходство — ЦЕНТРИРОВАННЫЙ косинус: из запроса и векторов записей
+    /// вычитается средний вектор корпуса. Для `mistral-embed` это обязательно:
+    /// сырой косинус несвязанных записей ≈ 0.9, и порог ничего не отсекает.
+    /// На маленьком корпусе (< `CENTER_MIN_ENTRIES`) центрирование нестабильно,
+    /// поэтому работает обычный косинус.
     pub fn query(&self, entries: &[Entry], query_embedding: &[f32]) -> Vec<QueryHit> {
-        let mut hits: Vec<QueryHit> = entries
+        let valid: Vec<&Entry> = entries
             .iter()
             // Битые записи (metadata.corrupt) в выдачу НЕ идут: они помечены
             // после неудачной консолидации и могут содержать мусор.
             .filter(|e| !e.metadata.corrupt)
             .filter(|e| !e.metadata.embedding.is_empty())
+            .collect();
+        let mean = if valid.len() >= CENTER_MIN_ENTRIES {
+            corpus_mean(valid.iter().map(|e| e.metadata.embedding.as_slice()))
+        } else {
+            Vec::new()
+        };
+        let mut hits: Vec<QueryHit> = valid
+            .into_iter()
             .map(|e| QueryHit {
                 entry: e.clone(),
-                relatedness: cosine_similarity(query_embedding, &e.metadata.embedding),
+                relatedness: centered_cosine(query_embedding, &e.metadata.embedding, &mean),
             })
             .filter(|h| h.relatedness >= self.min_relatedness)
             .collect();
@@ -700,6 +791,36 @@ mod tests {
     fn cosine_empty_is_zero() {
         let a: Vec<f32> = vec![];
         assert_eq!(cosine_similarity(&a, &a), 0.0);
+    }
+
+    #[test]
+    fn centered_cosine_removes_shared_baseline() {
+        // Два ортогональных направления с большим общим смещением: сырой
+        // косинус почти 1, центрированный — ноль. Именно этот эффект даёт
+        // mistral-embed на длинных русских текстах.
+        let mean = vec![10.0f32, 10.0];
+        let a = vec![11.0f32, 10.0];
+        let b = vec![10.0f32, 11.0];
+        assert!(cosine_similarity(&a, &b) > 0.99);
+        assert!(centered_cosine(&a, &b, &mean).abs() < 1e-4);
+    }
+
+    #[test]
+    fn centered_cosine_keeps_same_topic_high() {
+        let mean = vec![10.0f32, 10.0];
+        let a = vec![12.0f32, 10.5];
+        let b = vec![11.5f32, 10.2];
+        assert!(centered_cosine(&a, &b, &mean) > 0.9);
+    }
+
+    #[test]
+    fn corpus_mean_averages_nonempty_vectors() {
+        let a = [1.0f32, 2.0];
+        let b = [3.0f32, 4.0];
+        let empty: [f32; 0] = [];
+        let m = corpus_mean([a.as_slice(), b.as_slice(), empty.as_slice()]);
+        assert_eq!(m, vec![2.0, 3.0]);
+        assert!(corpus_mean(std::iter::empty::<&[f32]>()).is_empty());
     }
 
     #[test]

@@ -239,6 +239,71 @@ fn self_state_forbidden_hit(s: &str) -> Option<&'static str> {
     BAD.iter().copied().find(|m| low.contains(m))
 }
 
+/// Убирает из `self_state` служебные meta-строки, которые модель дописывает
+/// в конце правки: «*(Заменено упоминание фотографий на нитки, добавлено…)*».
+///
+/// Это не её состояние, а комментарий к диффу. В промпте он выглядит как часть
+/// её мыслей (и попадает в idle-стимул), поэтому вычищаем такие строки и в
+/// момент записи, и при чтении старых файлов.
+pub fn sanitize_self_state(body: &str) -> String {
+    const META_MARKERS: &[&str] = &[
+        "заменено",
+        "заменен",
+        "добавлено",
+        "добавлен",
+        "убраны",
+        "убран",
+        "удалено",
+        "удалён",
+        "удален",
+        "исправлено",
+        "исправлен",
+        "переписано",
+        "переписан",
+        "изменено",
+        "вставлено",
+        "вставлен",
+        "следы диалога",
+        "примечание",
+    ];
+    let mut kept: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            kept.push("");
+            continue;
+        }
+        let low = t.to_lowercase();
+        let starts_like_note = t.starts_with("*(")
+            || t.starts_with('(')
+            || t.starts_with("Примечание")
+            || t.starts_with("**Примечание")
+            || t.starts_with("_(");
+        let has_marker = META_MARKERS.iter().any(|m| low.contains(m));
+        let explicit_diff = low.contains("заменено упоминание") || low.contains("следы диалога");
+        if (starts_like_note && has_marker) || explicit_diff {
+            continue;
+        }
+        kept.push(line);
+    }
+    // Схлопываем двойные пустые строки и обрезаем хвост.
+    let mut out = String::new();
+    let mut blanks = 0usize;
+    for line in kept {
+        if line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
 /// Обновляет `self_state.md` — ЕЁ СОБСТВЕННОЕ состояние (не про пользователя).
 ///
 /// Единая точка входа для консолидации и стартового бутстрапа: держим файл
@@ -288,6 +353,8 @@ pub async fn update_self_state(
                         MessageContent::Parts(_) => None,
                     })
                     .unwrap_or_default();
+                // Срезаем служебные «*(Заменено…)*» до проверок и записи.
+                let body = sanitize_self_state(&body);
                 if body.trim().is_empty() {
                     warn!("[self_state] пустой ответ LLM — файл не трогаю");
                     return;
@@ -336,7 +403,27 @@ fn read_chat_memory(diary_dir: &str, chat_id: i64) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::self_state_forbidden_hit;
+    use super::{sanitize_self_state, self_state_forbidden_hit};
+
+    #[test]
+    fn sanitize_drops_meta_diff_lines() {
+        let raw = "**Настроение:** спокойно и тепло.\n\
+                   **Чем занята:** вяжу ленту в хвост, пью чай.\n\
+                   **Мысли:** хочу доделать рисунок.\n\
+                   **Обновлено:** 26.10 16:42\n\
+                   *(Заменено упоминание фотографий на нитки, добавлено движение тела, убраны все следы диалога.)*";
+        let clean = sanitize_self_state(raw);
+        assert!(clean.contains("вяжу ленту"), "{clean}");
+        assert!(!clean.contains("Заменено"), "{clean}");
+        assert!(!clean.contains("следы диалога"), "{clean}");
+    }
+
+    #[test]
+    fn sanitize_keeps_normal_parentheticals() {
+        let raw = "**Настроение:** тихо (и это хорошо).\n**Чем занята:** читаю.";
+        let clean = sanitize_self_state(raw);
+        assert!(clean.contains("тихо (и это хорошо)"), "{clean}");
+    }
 
     #[test]
     fn self_state_guard_flags_needy_frames() {

@@ -136,8 +136,16 @@ pub fn write_chat_state(
 }
 
 /// Собирает вход для LLM-вызова оценки: его последнее сообщение + хвост
-/// истории + прошлая оценка (для непрерывности).
-pub fn build_assess_input(last_message: &str, history_tail: &str, prev_state: &str) -> String {
+/// истории (10–20 реплик с полной датой и ролью) + прошлая оценка.
+///
+/// `last_turn` — кто писал последним ПЕРЕД его текущим сообщением (`ОН`/`Я`).
+/// Без этого оценщик путает, чья реплика была ходом, и приписывает её себе.
+pub fn build_assess_input(
+    last_message: &str,
+    history_tail: &str,
+    prev_state: &str,
+    last_turn: &str,
+) -> String {
     let mut s = String::new();
     if !prev_state.trim().is_empty() {
         s.push_str("ПРЕДЫДУЩАЯ ОЦЕНКА (для непрерывности, может быть пустой):\n");
@@ -145,9 +153,13 @@ pub fn build_assess_input(last_message: &str, history_tail: &str, prev_state: &s
         s.push_str("\n\n");
     }
     if !history_tail.trim().is_empty() {
-        s.push_str("НЕДАВНИЙ ЧАТ (хронологически, старые сверху):\n");
+        s.push_str(
+            "НЕДАВНИЙ ЧАТ (хронологически, старые сверху; ОН — собеседник, Я — ты; \
+             в скобках полная дата и время):\n",
+        );
         s.push_str(history_tail.trim());
         s.push_str("\n\n");
+        s.push_str(&format!("ПОСЛЕДНИЙ ХОД ПЕРЕД ЕГО СООБЩЕНИЕМ: {}\n\n", last_turn.trim()));
     }
     s.push_str("ЕГО ПОСЛЕДНЕЕ СООБЩЕНИЕ (оцени именно его):\n");
     s.push_str(last_message.trim());
@@ -166,6 +178,7 @@ pub fn build_idle_assess_input(
     history_tail: &str,
     prev_state: &str,
     self_state: &str,
+    last_turn: &str,
 ) -> String {
     let mut s = String::new();
     if !prev_state.trim().is_empty() {
@@ -174,9 +187,13 @@ pub fn build_idle_assess_input(
         s.push_str("\n\n");
     }
     if !history_tail.trim().is_empty() {
-        s.push_str("НЕДАВНИЙ ЧАТ (хронологически, старые сверху):\n");
+        s.push_str(
+            "НЕДАВНИЙ ЧАТ (хронологически, старые сверху; ОН — собеседник, Я — ты; \
+             в скобках полная дата и время):\n",
+        );
         s.push_str(history_tail.trim());
         s.push_str("\n\n");
+        s.push_str(&format!("ПОСЛЕДНИЙ ХОД ПЕРЕД ЭТИМ: {}\n\n", last_turn.trim()));
     }
     if !self_state.trim().is_empty() {
         s.push_str("ЕЁ СОБСТВЕННОЕ СОСТОЯНИЕ (её день, настроение, дела):\n");
@@ -203,15 +220,30 @@ mod tests {
             "12:00 Александр: привет",
             "Он: устал.\nЯ: спокойна.",
             "Сегодня доделала рисунок, хочу показать.",
+            "ОН",
         );
         assert!(s.contains("14:05"));
         assert!(s.contains("его сообщения НЕТ"));
         assert!(s.contains("доделала рисунок"), "нет её состояния: {s}");
         assert!(s.contains("СОСТОЯНИЕ ОН:"), "нет меток: {s}");
+        assert!(s.contains("ПОСЛЕДНИЙ ХОД ПЕРЕД ЭТИМ: ОН"), "нет хода: {s}");
         assert!(
             s.contains("Не выдумывай"),
             "нет запрета выдумывать его состояние: {s}"
         );
+    }
+
+    #[test]
+    fn live_input_marks_last_turn_and_roles() {
+        let s = build_assess_input(
+            "ну и что мне теперь делать",
+            "[26.10.2026 14:05] ОН (Саша): я устал\n[26.10.2026 14:06] Я (Фуринья): тогда отдохни",
+            "",
+            "Я",
+        );
+        assert!(s.contains("ОН — собеседник, Я — ты"), "{s}");
+        assert!(s.contains("ПОСЛЕДНИЙ ХОД ПЕРЕД ЕГО СООБЩЕНИЕМ: Я"), "{s}");
+        assert!(s.contains("ЕГО ПОСЛЕДНЕЕ СООБЩЕНИЕ"), "{s}");
     }
 
     #[test]

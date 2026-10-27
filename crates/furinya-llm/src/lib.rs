@@ -877,14 +877,34 @@ while i < out.len() {
     if m.role == Role::Assistant {
         if let Some(calls) = m.tool_calls.clone() {
             if !calls.is_empty() {
-                // Считаем, сколько tool-ответов идёт сразу после.
+                // Дедуп по id: стрим иногда присылает один и тот же id дважды,
+                // и API считает, что вызовов больше, чем ответов → 3230.
+                let mut seen = std::collections::HashSet::new();
+                let calls: Vec<ToolCall> = calls
+                    .into_iter()
+                    .filter(|c| !c.id.is_empty() && seen.insert(c.id.clone()))
+                    .collect();
+                // Считаем tool-ответы, идущие сразу после, и их id.
                 let mut j = i + 1;
-                let mut answers = 0usize;
+                let mut answered: Vec<String> = Vec::new();
                 while j < out.len() && out[j].role == Role::Tool {
-                    answers += 1;
+                    if let Some(id) = out[j].tool_call_id.clone() {
+                        answered.push(id);
+                    }
                     j += 1;
                 }
-                if answers == 0 {
+                // Оставляем ТОЛЬКО те вызовы, на которые есть ответ: один
+                // неотвеченный вызов из пачки роняет весь запрос (3230
+                // "Not the same number of function calls and responses").
+                let mut kept_calls: Vec<ToolCall> = Vec::new();
+                for c in calls {
+                    if answered.iter().any(|a| a == &c.id)
+                        && !kept_calls.iter().any(|k| k.id == c.id)
+                    {
+                        kept_calls.push(c);
+                    }
+                }
+                if kept_calls.is_empty() {
                     // 3) ответов нет — снимаем вызовы, оставляем текст.
                     let mut plain = m.clone();
                     plain.tool_calls = None;
@@ -892,6 +912,23 @@ while i < out.len() {
                     i += 1;
                     continue;
                 }
+                let mut fixed = m.clone();
+                fixed.tool_calls = Some(kept_calls.clone());
+                cleaned.push(fixed);
+                i += 1;
+                // Пропускаем блок tool-ответов: по одному на каждый оставленный
+                // вызов, в порядке вызовов. Дубли и ответы на снятые вызовы
+                // выбрасываем — иначе снова дисбаланс.
+                let mut used: Vec<String> = Vec::new();
+                while i < out.len() && out[i].role == Role::Tool {
+                    let id = out[i].tool_call_id.clone().unwrap_or_default();
+                    if kept_calls.iter().any(|c| c.id == id) && !used.contains(&id) {
+                        used.push(id);
+                        cleaned.push(out[i].clone());
+                    }
+                    i += 1;
+                }
+                continue;
             }
         }
     }
@@ -1355,6 +1392,82 @@ mod sanitize_tests {
         let out = sanitize_messages(msgs);
         assert_eq!(out.len(), 4);
         assert_eq!(out.last().unwrap().role, Role::User);
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: "{}".into(),
+            },
+        }
+    }
+
+    fn result(id: &str) -> Message {
+        Message::tool_result(Some(id.to_string()), Some("x".to_string()), "ok")
+    }
+
+    #[test]
+    fn partial_answers_drop_unanswered_calls() {
+        // Живой 3230: в пачке 3 вызова, но лимит частей оборвал цикл после
+        // первого — Mistral: "Not the same number of function calls and
+        // responses". Вызовы без ответа снимаем, ответы на них тоже.
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            Message::assistant_tool_calls(
+                "",
+                vec![
+                    call("c1", "send_telegram_message"),
+                    call("c2", "generate_image"),
+                    call("c3", "send_voice_message"),
+                ],
+            ),
+            result("c1"),
+        ];
+        let out = sanitize_messages(msgs);
+        let a = out.iter().find(|m| m.role == Role::Assistant).unwrap();
+        let calls = a.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "c1");
+        let tools: Vec<_> = out.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_call_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn duplicate_call_ids_are_deduped() {
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            Message::assistant_tool_calls(
+                "",
+                vec![call("c1", "send_telegram_message"), call("c1", "send_telegram_message")],
+            ),
+            result("c1"),
+        ];
+        let out = sanitize_messages(msgs);
+        let a = out.iter().find(|m| m.role == Role::Assistant).unwrap();
+        assert_eq!(a.tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(out.iter().filter(|m| m.role == Role::Tool).count(), 1);
+    }
+
+    #[test]
+    fn duplicate_tool_results_are_dropped() {
+        let msgs = vec![
+            Message::system("s"),
+            Message::user("привет"),
+            Message::assistant_tool_calls("", vec![call("c1", "ask")]),
+            result("c1"),
+            result("c1"),
+            result("c9"),
+        ];
+        let out = sanitize_messages(msgs);
+        assert_eq!(out.iter().filter(|m| m.role == Role::Tool).count(), 1);
+        // Второй tool-результат без владельца не должен остаться в истории.
+        assert!(out.iter().all(|m| m.role != Role::Tool || m.tool_call_id.as_deref() == Some("c1")));
     }
 }
 

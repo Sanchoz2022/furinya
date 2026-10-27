@@ -258,10 +258,31 @@ async fn main() -> Result<()> {
         {
             match diary.embedding().embed(text).await {
                 Ok(vec) => {
-                    let mut all: Vec<_> = diary_entries
+                    // Тот же центрированный косинус, что и в рабочем RAG:
+                    // у mistral-embed сырое сходство ~0.9 даже у мусора.
+                    let valid: Vec<_> = diary_entries
                         .iter()
                         .filter(|e| !e.metadata.embedding.is_empty())
-                        .map(|e| (furinya_diary::cosine_similarity(&vec, &e.metadata.embedding), e))
+                        .collect();
+                    let mean = if valid.len() >= furinya_diary::CENTER_MIN_ENTRIES {
+                        furinya_diary::corpus_mean(
+                            valid.iter().map(|e| e.metadata.embedding.as_slice()),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    let mut all: Vec<_> = valid
+                        .into_iter()
+                        .map(|e| {
+                            (
+                                furinya_diary::centered_cosine(
+                                    &vec,
+                                    &e.metadata.embedding,
+                                    &mean,
+                                ),
+                                e,
+                            )
+                        })
                         .collect();
                     all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                     let hits: Vec<_> = all

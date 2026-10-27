@@ -90,6 +90,9 @@ impl ChatTurn {
     }
 }
 
-pub use diary::{Diary, Entry, EntryMetadata, QueryHit, cosine_similarity, parse_consolidated};
+pub use diary::{
+    CENTER_MIN_ENTRIES, Diary, Entry, EntryMetadata, QueryHit, centered_cosine, corpus_mean,
+    cosine_similarity, parse_consolidated,
+};
 pub use embedding::EmbeddingClient;
 

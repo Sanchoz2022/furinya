@@ -563,6 +563,56 @@ fn extract_query_arg(args: &str) -> Option<String> {
     None
 }
 
+/// Форматирует unix-время в локальный штамп `[ДД.ММ.ГГГГ ЧЧ:ММ]` —
+/// для оценки хода, где важна точная дата, а не только время суток.
+/// Если `ts == 0` (неизвестно) — возвращает пустую строку.
+fn format_ts_full(ts: i64) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
+    use std::time::UNIX_EPOCH;
+    let secs = ts as u64;
+    match UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs)) {
+        Some(t) => {
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            format!("[{}]", dt.format("%d.%m.%Y %H:%M"))
+        }
+        None => String::new(),
+    }
+}
+
+/// Хвост диалога для ОЦЕНКИ ХОДА: до `max_rows` последних реплик ОБЕИХ сторон
+/// с полной датой/временем и явной ролью (`ОН` / `Я`).
+///
+/// Оценщик должен видеть 10–20 последних сообщений и понимать, чей был ход
+/// перед текущим, — иначе он путает роли и приписывает ей его слова.
+/// Возвращает `(текст хвоста, кто писал последним)`.
+fn assess_history_text(
+    cfg: &Config,
+    rows: &[(i64, bool, String, i64)],
+    max_rows: usize,
+) -> (String, String) {
+    let start = rows.len().saturating_sub(max_rows);
+    let mut out = String::new();
+    let mut last_turn = "<до этого реплик не было>".to_string();
+    for (sender, is_me, text, date) in &rows[start..] {
+        if text.trim().is_empty() {
+            continue;
+        }
+        let name = crate::identity::display_name(cfg, cfg.general.telegram_my_id, *sender);
+        let role = if *is_me { "Я" } else { "ОН" };
+        out.push_str(&format!(
+            "{} {} ({}): {}\n",
+            format_ts_full(*date),
+            role,
+            name,
+            text.trim()
+        ));
+        last_turn = format!("{role} ({name})");
+    }
+    (out, last_turn)
+}
+
 /// Форматирует unix-время в локальный штамп `[ДД.ММ ЧЧ:ММ]`.
 /// Если `ts == 0` (неизвестно) — возвращает пустую строку.
 fn format_ts(ts: i64) -> String {
@@ -700,18 +750,42 @@ async fn bootstrap_self_state(
 /// и упиралась в окно модели.
 fn budgeted_block(parts: &[String], budget: usize) -> String {
     let mut out = String::new();
+    let mut used = 0usize;
     for p in parts {
-        if out.chars().count() >= budget {
+        if used >= budget {
             break;
         }
-        let rest = budget - out.chars().count();
-        let piece = take_chars(p, rest);
-        let full = piece.chars().count() == p.chars().count();
-        out.push_str(&piece);
-        if !full {
-            out.push_str("…");
-            break;
+        let plen = p.chars().count();
+        if used + plen <= budget {
+            out.push_str(p);
+            used += plen;
+            continue;
         }
+        // Не влезает целиком. Если это первая (лучшая) запись — даём
+        // усечённую, но по границе абзаца/предложения, а не посреди слова
+        // (иначе модель читает обрубок и путает смысл воспоминания).
+        if out.is_empty() {
+            let room = budget.saturating_sub(1);
+            let piece = take_chars(p, room);
+            let cut = piece
+                .rfind('\n')
+                .or_else(|| piece.rfind(". "))
+                .or_else(|| piece.rfind('!'))
+                .or_else(|| piece.rfind('?'));
+            match cut {
+                Some(i) => {
+                    out.push_str(&piece[..i + 1]);
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                None => {
+                    out.push_str(piece.trim_end());
+                    out.push('…');
+                }
+            }
+        }
+        break;
     }
     out
 }
@@ -931,6 +1005,57 @@ fn explicit_scene_active(his_last: &str, own_recent: &[String]) -> bool {
         .any(|t| is_intimate_text(t))
 }
 
+/// Уклонение от откровенной сцены: он уже сказал прямо, чего хочет, а она
+/// отвечает «давай поговорим», «сначала поговорим», «не будем торопиться»,
+/// «мне нужно знать, что ты действительно хочешь». Это не игра и не согласие —
+/// это выход из сцены, который он слышит как отказ. Промпт такие фразы уже
+/// запрещает, но модель иногда всё равно их выдаёт, поэтому режем детерминированно.
+fn scene_deflection_hit(text: &str) -> Option<&'static str> {
+    let low = text.to_lowercase().replace('ё', "е");
+    const PHRASES: &[&str] = &[
+        "давай поговорим",
+        "давай сначала поговорим",
+        "сначала поговорим",
+        "давай сначала",
+        "давай обо всем поговорим",
+        "не будем торопиться",
+        "не надо торопиться",
+        "давай не будем торопиться",
+        "может, не будем",
+        "мне нужно знать, что ты",
+        "мне нужно знать, чего ты",
+        "мне надо знать, что ты",
+        "мне надо знать, чего ты",
+        "хочу знать, что ты действительно",
+        "хочу знать, чего ты действительно",
+        "что ты действительно хочешь",
+        "чего ты действительно хочешь",
+        "ты действительно этого хочешь",
+        "сначала мне нужно понять",
+        "давай обсудим",
+        "давай расслабимся",
+        "сначала расслабимся",
+        "не могу просто так",
+        "если ты не готов",
+        "мне нужно, чтобы ты понял",
+        "дай мне минутку, чтобы",
+    ];
+    if PHRASES.iter().any(|p| low.contains(p)) {
+        return Some("уклонение от сцены («давай поговорим» / «сначала разберёмся»)");
+    }
+    // «поговорим об этом» без «давай» — тоже уход, но «поговорим позже,
+    // когда закончим» в игре допустимо, поэтому смотрим только на связку с
+    // началом реплики или с «сначала».
+    let compact = low.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.starts_with("поговорим")
+        || compact.contains("поговорим об этом")
+        || compact.contains("поговорим об этом потом")
+    {
+        return Some("уклонение от сцены («давай поговорим» / «сначала разберёмся»)");
+    }
+    None
+}
+
 /// Дежурные формулы-пустышки, которые модель выдаёт вместо реакции на его
 /// конкретные слова. Возвращает сработавший шаблон — чтобы tool-ошибка
 /// объяснила модели, ЧТО именно не так.
@@ -1056,6 +1181,19 @@ fn fragment_hit(text: &str) -> Option<&'static str> {
     let t = text.trim_end();
     let t = t.trim_start();
     let starts_dots = t.starts_with("...") || t.starts_with('…');
+    // Часть, кончившаяся двоеточием, — обрезанный текст: «…шепчу на ухо:» —
+    // это анонс реплики, которой в сообщении нет. Живой прогон 27.10: такое
+    // ушло единственным текстом хода вместе с фото.
+    if t.trim_end().ends_with(':') {
+        return Some("часть закончилась двоеточием (текст обрезан)");
+    }
+    // Только действие в скобках (возможно, с двоеточием/точкой на конце) —
+    // не реплика: в чат должно уходить действие ВНУТРИ сообщения со словами.
+    let action_probe = t
+        .trim_end_matches(|c: char| c.is_whitespace() || c == ':' || c == '.' || c == ',');
+    if action_only(action_probe).is_some() {
+        return Some("только действие в скобках, без реплики");
+    }
     // Хвостовые эмодзи/знаки после многоточия не должны прятать обрубок:
     // «Сейчас, милашка... 📸» — это обещание без содержания, а проверка
     // `ends_with("...")` его пропускала.
@@ -1076,7 +1214,7 @@ fn fragment_hit(text: &str) -> Option<&'static str> {
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| !w.is_empty())
         .count();
-    if spoken_words <= 6 && ends_dots {
+    if spoken_words <= 4 && ends_dots {
         return Some("недописанная мысль с многоточием");
     }
     None
@@ -1355,12 +1493,24 @@ async fn execute_tg_tool(
             // клише оказались все — возвращаем ошибку с указанием на его слова.
             let mut kept: Vec<String> = Vec::new();
             let mut dropped: Vec<(&'static str, String)> = Vec::new();
+            let mut deflect_dropped = 0usize;
             // В откровенной сцене «хочешь, чтобы я…» — живая реплика, а не
             // ассистентская формула. Живой ход 15:56: модель пять раз подряд
             // пыталась отправить «хочешь, чтобы я говорила, а ты слушал?»,
             // фильтр срезал всё, и ход закончился без единого текста.
             let explicit_turn = explicit_scene_active(his_last, own_recent);
             for part in parts {
+                if explicit_turn {
+                    if let Some(why) = scene_deflection_hit(&part) {
+                        // Откровенная сцена: он сказал прямо, чего хочет.
+                        // «Давай поговорим» здесь — не игра, а выход из сцены.
+                        warn!("[tg] уклонение в сцене выкинуто: {why} — {:?}", part);
+                        rep.remember_blocked(&part);
+                        dropped.push((why, part));
+                        deflect_dropped += 1;
+                        continue;
+                    }
+                }
                 if let Some(why) = cliche_hit(&part).or_else(|| fragment_hit(&part)) {
                     if explicit_turn && why.contains("хочешь, чтобы я") {
                         kept.push(part);
@@ -1374,6 +1524,22 @@ async fn execute_tg_tool(
                 }
             }
             if kept.is_empty() {
+                if explicit_turn && deflect_dropped > 0 && deflect_dropped == dropped.len() {
+                    let quote: String = his_last.trim().chars().take(180).collect::<String>();
+                    return (
+                        format!(
+                            "НЕ ОТПРАВЛЕНО: ты уклонилась от откровенной сцены («давай \
+                             поговорим», «сначала разберёмся», «мне нужно знать, чего ты \
+                             хочешь»). Он уже сказал прямо: «{quote}». Это не вопрос и не \
+                             просьба о разговоре — он хочет тебя сейчас. Не спрашивай \
+                             разрешения и не переводи в беседу: напиши, что ты ДЕЛАЕШЬ с ним \
+                             в эту минуту (телом, голосом), и что чувствуешь. Можно позвать \
+                             его к себе, можно сказать, куда хочешь его руки. Без «давай», без \
+                             «сначала», без «а ты точно хочешь»."
+                        ),
+                        Vec::new(),
+                    );
+                }
                 let why = dropped.first().map(|(w, _)| *w).unwrap_or("дежурная формула");
                 let quote: String = his_last.trim().chars().take(180).collect::<String>();
                 return (
@@ -1930,6 +2096,24 @@ async fn execute_tg_tool(
                     Vec::new(),
                 );
             }
+            // Откровенная сцена: голосом тоже нельзя уклоняться («давай сначала
+            // расслабимся», «мне нужно, чтобы ты понял…»). Живой прогон 27.10:
+            // текстовые части фильтр прошли, а отказ ушёл именно голосовым.
+            if explicit_scene_active(his_last, own_recent) {
+                if let Some(why) = scene_deflection_hit(&voice_text) {
+                    warn!("[tg] уклонение в голосовом: {why} — {voice_text:?}");
+                    rep.remember_blocked(&voice_text);
+                    return (
+                        format!(
+                            "НЕ ОТПРАВЛЕНО: {why}. Он сказал прямо, чего хочет, — не \
+                             переводи это в разговор и не ставь условий. Скажи голосом, что ты \
+                             ДЕЛАЕШЬ с ним сейчас и что чувствуешь, без «давай», без «сначала», \
+                             без «если ты готов»."
+                        ),
+                        Vec::new(),
+                    );
+                }
+            }
             // Анти-повтор: то же самое для голосовых (ночные обнимашки шли
             // одной и той же фразой). Учитываем и ранее заблокированные
             // черновики этого хода — иначе модель повторяла заблокированную
@@ -2065,6 +2249,9 @@ async fn assess_turn(
         client.send_action_typing(chat_id);
     }
     let assess_llm = llm.with_temperature(0.3);
+    // Полный вход оценки — только на debug (RUST_LOG=furinya_tg=debug):
+    // в обычном логе это десятки строк на каждый ход.
+    debug!("[tg] вход оценки хода:\n{input}");
     let call = assess_llm.chat(vec![Message::system(assess_prompt), Message::user(input)], None);
     match tokio::time::timeout(Duration::from_secs(20), call).await {
         Ok(Ok(resp)) => {
@@ -2339,19 +2526,23 @@ pub async fn handle_new_message(
     let assessment: Option<Assessment> = if !is_idle && !his_words.trim().is_empty() {
         let diary_dir = std::path::Path::new(&cfg.misc.diary_dir);
         let prev_state = read_chat_state(diary_dir, chat_id);
-        // Хвост истории: последние реплики (её и его) ДО его текущего
+        // Хвост истории: последние 20 реплик (её и его) ДО его текущего
         // сообщения — оно идёт в оценку отдельно, без обёрток (голос/фото).
+        // Полная дата/время + роль нужны, чтобы оценщик не путал ходы.
         let hist_end = tg_history_full.len().saturating_sub(1);
-        let hist_start = hist_end.saturating_sub(6);
-        let hist_tail = situation_exchange_text(cfg, &tg_history_full[hist_start..hist_end]);
-        let input = build_assess_input(&his_words, &hist_tail, &prev_state);
+        let hist_start = hist_end.saturating_sub(20);
+        let (hist_tail, last_turn) =
+            assess_history_text(cfg, &tg_history_full[hist_start..hist_end], 20);
+        let input = build_assess_input(&his_words, &hist_tail, &prev_state, &last_turn);
         assess_turn(llm, prompts, input, &client, chat_id, true).await
     } else if is_idle {
         let diary_dir = std::path::Path::new(&cfg.misc.diary_dir);
         let prev_state = read_chat_state(diary_dir, chat_id);
-        let hist_start = tg_history_full.len().saturating_sub(6);
-        let hist_tail = situation_exchange_text(cfg, &tg_history_full[hist_start..]);
+        let hist_start = tg_history_full.len().saturating_sub(20);
+        let (hist_tail, last_turn) =
+            assess_history_text(cfg, &tg_history_full[hist_start..], 20);
         let self_state = std::fs::read_to_string(diary_dir.join("self_state.md"))
+            .map(|s| furinya_diary::consolidate::sanitize_self_state(&s))
             .unwrap_or_default();
         let local_time = Local::now().format("%H:%M").to_string();
         let input = build_idle_assess_input(
@@ -2359,6 +2550,7 @@ pub async fn handle_new_message(
             &hist_tail,
             &prev_state,
             &self_state,
+            &last_turn,
         );
         assess_turn(llm, prompts, input, &client, chat_id, false).await
     } else {
@@ -2436,6 +2628,26 @@ pub async fn handle_new_message(
                 // с их полными телами (десятки КБ).
                 let hits = diary.query_top_n(diary_entries, &emb, 4);
                 if !hits.is_empty() {
+                    // Компактный след для разбора памяти в проде: сколько
+                    // записей прошло порог и с каким сходством. Без него
+                    // «каша» в ответах неотличима от «не нашлось ничего».
+                    let scores: Vec<String> = hits
+                        .iter()
+                        .map(|h| format!("{:.2}", h.relatedness))
+                        .collect();
+                    let first_line = hits[0]
+                        .entry
+                        .body
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("")
+                        .trim();
+                    info!(
+                        "[rag] {} хитов [{}] топ: {}",
+                        hits.len(),
+                        scores.join(", "),
+                        take_chars(first_line, 90)
+                    );
                     let parts: Vec<String> = hits
                         .iter()
                         .map(|h| format!("- {}\n", h.entry.body))
@@ -2482,6 +2694,7 @@ pub async fn handle_new_message(
             // чтобы писать первой своё, а не дежурное «ты тут?».
             let self_state_path = std::path::Path::new(&cfg.misc.diary_dir).join("self_state.md");
             if let Ok(self_state) = std::fs::read_to_string(&self_state_path) {
+                let self_state = furinya_diary::consolidate::sanitize_self_state(&self_state);
                 let self_state = self_state.trim();
                 if !self_state.is_empty() {
                     let block = take_chars(self_state, 1200);
@@ -2680,20 +2893,28 @@ pub async fn handle_new_message(
         // Все tool_calls этого хода — ОДНИМ assistant-сообщением (валидный
         // порядок для Mistral/OpenAI: assistant(tool_calls...) → tool × N).
         // Пустые id генерируем: модели при стриминге иногда шлют id пустым.
+        // Дубли id тоже чиним: два вызова с одинаковым id API считает одним
+        // вызовом, и ответов «больше, чем вызовов» → 400 3230.
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let turn_calls: Vec<ToolCall> = tool_calls
             .iter()
             .enumerate()
-            .map(|(i, call)| ToolCall {
-                id: {
-                    let raw = call.id.trim();
-                    if raw.is_empty() {
-                        format!("call_t{}_{}", turn, i)
-                    } else {
-                        raw.to_string()
-                    }
-                },
-                call_type: call.call_type.clone(),
-                function: call.function.clone(),
+            .map(|(i, call)| {
+                let raw = call.id.trim();
+                let mut id = if raw.is_empty() {
+                    format!("call_t{}_{}", turn, i)
+                } else {
+                    raw.to_string()
+                };
+                if !seen_ids.insert(id.clone()) {
+                    id = format!("{id}_dup{i}");
+                    seen_ids.insert(id.clone());
+                }
+                ToolCall {
+                    id,
+                    call_type: call.call_type.clone(),
+                    function: call.function.clone(),
+                }
             })
             .collect();
         turn_ctx.push(Message::assistant_tool_calls(
@@ -2702,8 +2923,21 @@ pub async fn handle_new_message(
         ));
 
         let mut real_tool_done = false;
+        // Лимит частей выбран внутри ЭТОГО хода: остальные вызовы не выполняем,
+        // но каждый обязан получить tool-результат — иначе следующий запрос к
+        // Mistral падает 3230 "Not the same number of function calls and responses".
+        let mut budget_exhausted = false;
         for (call_idx, tc) in tool_calls.iter().enumerate() {
             let call_id = turn_calls[call_idx].id.clone();
+            if budget_exhausted {
+                turn_ctx.push(Message::tool_result(
+                    Some(call_id),
+                    Some(tc.function.name.clone()),
+                    "Пропущено: лимит сообщений за этот ход уже исчерпан. В чат больше ничего не отправляй."
+                        .to_string(),
+                ));
+                continue;
+            }
             // Свои недавние реплики для анти-повтора: из полной живой истории
             // (is_me=true), последние 24 (окно kuni — 16; шире, чтобы не
             // проскакивать повтор через пару ходов). Считаем ПЕРЕД каждым
@@ -2836,11 +3070,14 @@ pub async fn handle_new_message(
                     tool_blocked = true;
                     if turn == max_turns {
                         // Лимит ходов: generic-заглушку не шлём — тишина.
+                        // Остальные вызовы пачки всё равно получают ответ,
+                        // иначе 3230 на следующем запросе.
                         warn!(
                             "[tg] send_telegram_message не удался за {} ходов — молчим",
                             max_turns
                         );
-                        break;
+                        budget_exhausted = true;
+                        continue;
                     }
                     continue;
                 }
@@ -2888,11 +3125,14 @@ pub async fn handle_new_message(
                 parts_sent += sent_echo.len();
                 if parts_sent >= cfg.misc.max_message_parts {
                     // Жёсткий лимит сообщений за ход — не заваливаем чат.
+                    // НЕ break: оставшиеся tool_calls этого же хода должны
+                    // получить ответ, иначе 3230 на следующем запросе.
                     debug!(
-                        "[tg] лимит сообщений за ход ({} >= {}) — закрываем",
+                        "[tg] лимит сообщений за ход ({} >= {}) — остальные вызовы пропускаем",
                         parts_sent, cfg.misc.max_message_parts
                     );
-                    break;
+                    budget_exhausted = true;
+                    continue;
                 }
                 // ВАЖНО: здесь НЕ break. Модель часто вызывает в одном ходу
                 // send_telegram_message («сейчас, минутку 📸») И generate_image —
@@ -4187,12 +4427,14 @@ mod cliche_tests {
             "Я не знаю...",
             "...ну что тут думать-то?",
             "…и что мне теперь делать",
-            "два часа — это действительно изматывает...",
             // Живой прогон 26.10: ремарка в скобках раздувала счёт слов, и
             // обрубок уходил в чат единственным текстом хода.
             "(прижимаюсь ещё ближе, шепчу в микрофон) А теперь слушай внимательно...",
             // Эмодзи после многоточия прятал обрубок от проверки.
             "Сейчас, милашка... 📸",
+            // Анонс реплики без самой реплики — живой прогон 27.10.
+            "(прижимаюсь к нему телом, обхватываю за талию и шепчу на ухо):",
+            "(тихо смеётся).",
         ] {
             assert!(fragment_hit(t).is_some(), "не поймали обрубок: {t:?}");
         }
@@ -4200,6 +4442,11 @@ mod cliche_tests {
             "Я не знаю.",
             "Ты прав. Я не ответила.",
             "Сашенька, я не понимаю, о чём ты.",
+            // Законченная фраза с многоточием на конце — не обрубок, даже если
+            // слов немного: «Ты меня пугаешь, когда так говоришь... 😼» —
+            // живая реплика, а не обещание без содержания.
+            "Ты меня пугаешь, когда так говоришь... 😼",
+            "два часа — это действительно изматывает...",
             // Ремарка + законченная длинная реплика — не обрубок.
             "(прижимаюсь ближе) Я хочу, чтобы ты сейчас слушал меня очень внимательно и не отвлекался...",
         ] {
@@ -4337,6 +4584,32 @@ mod anti_repeat_tests {
     }
 
     #[test]
+    fn scene_deflections_are_caught() {
+        for t in [
+            "Давай поговорим. Сначала поговорим, а потом уже всё остальное.",
+            "Мне нужно знать, что ты действительно хочешь.",
+            "Не будем торопиться, хорошо?",
+            "Давай сначала разберёмся, что между нами.",
+            "Поговорим об этом потом.",
+            "Давай сначала расслабимся, я придумаю что-то, чтобы ты почувствовал себя ближе.",
+            "Я не могу просто так, если ты не готов ко мне полностью.",
+        ] {
+            assert!(scene_deflection_hit(t).is_some(), "не поймали уклонение: {t:?}");
+        }
+        for t in [
+            "Иди сюда. Я хочу чувствовать твои руки на своей талии.",
+            "Ложись. Я сама всё сделаю.",
+            "Ты меня пугаешь, когда так говоришь... 😼",
+            "Я хочу тебя, слышишь?",
+        ] {
+            assert!(
+                scene_deflection_hit(t).is_none(),
+                "ложное срабатывание: {t:?}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_and_short_inputs_are_safe() {
         assert_eq!(lexical_similarity("", "что-то"), 0.0);
         assert_eq!(lexical_similarity("что-то", ""), 0.0);
@@ -4346,3 +4619,34 @@ mod anti_repeat_tests {
     }
 }
 
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::budgeted_block;
+
+    #[test]
+    fn whole_pieces_fit_without_cutting() {
+        let parts = vec!["- короткая память\n".to_string(), "- вторая\n".to_string()];
+        let out = budgeted_block(&parts, 100);
+        assert_eq!(out, "- короткая память\n- вторая\n");
+    }
+
+    #[test]
+    fn first_piece_is_cut_at_sentence_boundary() {
+        let long = "- Первое предложение. Второе предложение, которое уже не влезает.";
+        let out = budgeted_block(&[long.to_string()], 40);
+        assert!(out.ends_with('\n') || out.ends_with('…'), "{out:?}");
+        assert!(!out.contains("Второе"), "обрезали посреди смысла: {out:?}");
+    }
+
+    #[test]
+    fn second_piece_is_dropped_if_it_does_not_fit() {
+        let parts = vec![
+            "- первая память целиком\n".to_string(),
+            "- вторая память, которая не влезает\n".to_string(),
+        ];
+        let out = budgeted_block(&parts, 30);
+        assert!(out.contains("первая"));
+        assert!(!out.contains("вторая"), "{out:?}");
+    }
+}

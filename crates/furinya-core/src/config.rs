@@ -275,7 +275,8 @@ fn default_plagiarism() -> f32 {
     0.97
 }
 fn default_relatedness() -> f32 {
-    0.8
+    // Центрированный косинус mistral-embed: фон ≈ 0, релевантный топ 0.2–0.35.
+    0.15
 }
 fn default_diary_keep_last() -> usize {
     10
@@ -788,17 +789,17 @@ record_voice.enabled = true
         assert!(cfg.general.llm.endpoint.base_url.contains("api.mistral.ai"));
         assert_eq!(cfg.general.llm.endpoint.model, "ministral-14b-2512");
         assert_eq!(cfg.general.llm.endpoint.fallback_model, "ministral-8b-2512");
-        // Эмбеддинги: Gemini embeddings (OpenAI-совместимый слой Google) —
-        // локальный llama.cpp на этом хосте считал запись ~4.6 с и грел железо.
-        // Модель обязана лежать ВНУТРИ endpoint.* — иначе в запрос уходит пустой
-        // model и бэкенд отвечает 400 (консолидация тихо откатывается в ноль).
-        assert_eq!(cfg.general.embedding.endpoint.model, "gemini-embedding-001");
+        // Эмбеддинги: Mistral (mistral-embed, 1024) — тот же ключ, что у LLM.
+        // Gemini-квота кончилась (429), локальный llama.cpp на этом хосте
+        // считал запись ~4.6 с и грел железо. Модель обязана лежать ВНУТРИ
+        // endpoint.* — иначе в запрос уходит пустой model и бэкенд отвечает 400.
+        assert_eq!(cfg.general.embedding.endpoint.model, "mistral-embed");
         assert!(cfg
             .general
             .embedding
             .endpoint
             .base_url
-            .contains("generativelanguage.googleapis.com"));
+            .contains("api.mistral.ai"));
         // Vision на Mistral API: ПРОВЕРЕНО живьём — ministral-14b/8b
         // мультимодальные (писали описания картинок), medium/small — 429.
         assert_eq!(
