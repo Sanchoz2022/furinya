@@ -386,6 +386,7 @@ dependencies = [
  "base64",
  "furinya-core",
  "image",
+ "rand 0.8.7",
  "reqwest",
  "serde",
  "serde_json",

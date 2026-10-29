@@ -11,6 +11,9 @@
 //! `generate_image(prompt)`, мы стучимся в бэкенд, сохраняем PNG на диск
 //! и возвращаем путь — дальше рантайм шлёт фото в Telegram.
 
+pub mod gallery;
+pub mod gallery_worker;
+
 use anyhow::{Context, Result};
 use base64::Engine;
 use furinya_core::config::{AiHordeConfig, EndpointConfig, SdRenderConfig, TakePhotoConfig};

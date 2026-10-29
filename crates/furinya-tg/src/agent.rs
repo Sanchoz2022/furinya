@@ -19,7 +19,7 @@ use furinya_llm::{
 use furinya_vision::describe_photo;
 use furinya_web::NewsHeadline;
 use furinya_audio::{synthesize_speech_openai, synthesize_fish_voice, transcribe_audio};
-use furinya_sd::generate_image;
+use furinya_sd::{gallery, generate_image};
 use chrono::{Datelike, Local, Timelike, Utc};
 use rand::Rng;
 use serde_json::Value;
@@ -1439,7 +1439,7 @@ const PHOTO_CRITIQUE_PROMPT: &str = "\
 
 /// Проверка готового фото зрением. Возвращает теги-исправления, если критик
 /// поставил низкую оценку и назвал, что править.
-async fn review_generated_image(cfg: &Config, path: &std::path::Path) -> Option<String> {
+async fn review_generated_image(cfg: &Config, path: &std::path::Path) -> (bool, f32, Option<String>) {
     let vcfg = &cfg.capabilities.vision;
     let vllm = LlmClient::new(
         &vcfg.llm_image_to_text.base_url,
@@ -1460,11 +1460,11 @@ async fn review_generated_image(cfg: &Config, path: &std::path::Path) -> Option<
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             warn!("[tg] критик фото: {e}");
-            return None;
+            return (false, 7.0, None); // Нет оценки — не генерим заново
         }
         Err(_) => {
             warn!("[tg] критик фото: таймаут 60с");
-            return None;
+            return (false, 7.0, None);
         }
     };
     info!("[tg] критик фото: {}", critique.replace('\n', " | "));
@@ -1475,8 +1475,9 @@ async fn review_generated_image(cfg: &Config, path: &std::path::Path) -> Option<
 /// Повторяем кадр, если оценка ниже 7 ИЛИ критик назвал серьёзный дефект
 /// (руки/анатомия/артефакты): даже при общей «8» такие вещи видно сразу,
 /// и именно из-за них фото выглядит сырым.
-fn parse_photo_critique(text: &str) -> Option<String> {
-    let mut score: i32 = 10;
+/// Возвращает: (нужна ли перегенерация, оценка, исправления).
+fn parse_photo_critique(text: &str) -> (bool, f32, Option<String>) {
+    let mut score: f32 = 10.0;
     let mut fixes = String::new();
     for line in text.lines() {
         let l = line.trim().trim_start_matches(|c: char| c == '*' || c == '-' || c == ' ');
@@ -1484,7 +1485,7 @@ fn parse_photo_critique(text: &str) -> Option<String> {
         if low.starts_with("оценка") {
             let digits: String = low.chars().filter(|c| c.is_ascii_digit()).collect();
             if let Ok(v) = digits.parse::<i32>() {
-                score = v;
+                score = v as f32;
             }
         } else if low.starts_with("исправить") {
             if let Some((_, rest)) = l.split_once(':') {
@@ -1494,7 +1495,7 @@ fn parse_photo_critique(text: &str) -> Option<String> {
     }
     let fixes_low = fixes.to_lowercase().replace('_', " ");
     if fixes.is_empty() || fixes_low.starts_with("нет") || fixes_low == "-" {
-        return None;
+        return (false, score, None);
     }
     const SEVERE: &[&str] = &[
         "extra finger",
@@ -1519,10 +1520,13 @@ fn parse_photo_critique(text: &str) -> Option<String> {
         "both eyes same",
     ];
     let severe = SEVERE.iter().any(|m| fixes_low.contains(m));
-    if score >= 7 && !severe {
-        return None;
-    }
-    Some(fixes.chars().take(300).collect())
+    let needs_regen = score < 7.0 || severe;
+    let fix_tags = if needs_regen {
+        Some(fixes.chars().take(300).collect())
+    } else {
+        None
+    };
+    (needs_regen, score, fix_tags)
 }
 
 async fn execute_tg_tool(
@@ -2177,7 +2181,21 @@ async fn execute_tg_tool(
             } else {
                 DEFAULT_SD_NEGATIVE.to_string()
             };
-            // Генерация + проверка зрением (как в старом «плюсовом» проекте):
+            // ── GALLERY-FIRST: сначала пытаемся взять из кэша ──────────────────
+            // Если есть подходяще�� фото (score ≥ 7.0) → мгновенная отдача, без SD.
+            if let Ok(Some(gallery_path)) = gallery::try_get_from_gallery(nsfw, 7.0).await {
+                client.send_photo(chat_id, gallery_path.to_str().unwrap_or(""));
+                info!("[tg] generate_image: отправлено из gallery (nsfw={nsfw})");
+                return (
+                    format!("Фото отправлено из галереи: {:?}", gallery_path),
+                    vec![format!("[я отправила ФОТО из галереи (сцена): {raw_prompt}]")],
+                );
+            }
+
+            // Fallback: live SD (3.5 мин).
+            info!("[tg] generate_image: gallery пуст или нет подходящих → генерация live");
+
+            // Генерация + проверка зрением (как в старом «пл��совом» проекте):
             // модель смотрит на свою же картинку, критикует её, и правка уходит
             // в промпт следующего кадра. Один кадр → критик → при явном браке
             // одна перегенерация с исправлениями.
@@ -2204,25 +2222,51 @@ async fn execute_tg_tool(
                 match generate_image(tp, &pos, &neg, nsfw, &out_path).await {
                     Ok(path) => {
                         if !review || attempt >= tp.review_retries {
-                            break Ok(path);
+                            break Ok((path, 7.0)); // Нет review → дефолтная оценка
                         }
-                        match review_generated_image(cfg, std::path::Path::new(&path)).await {
-                            Some(fix) => {
-                                warn!("[tg] generate_image: критик просит правки: {fix}");
+                        let (needs_regen, score, fix_tags) = review_generated_image(cfg, std::path::Path::new(&path)).await;
+                        if needs_regen {
+                            if let Some(fix) = fix_tags {
+                                warn!("[tg] generate_image: критик просит правки (score={:.1}): {fix}", score);
                                 pos = dedupe_exact_tags(&format!("{pos}, {fix}"));
                                 attempt += 1;
+                            } else {
+                                break Ok((path, score));
                             }
-                            None => break Ok(path),
+                        } else {
+                            break Ok((path, score));
                         }
                     }
                     Err(e) => break Err(e),
                 }
             };
             match generated {
-                Ok(path) => {
+                Ok((path, score)) => {
+                    // ── СОХРАНЕНИЕ В GALLERY ────────────────────────────────────
+                    // Если фото годное (score ≥ 7.0) → сохраняем в кэш для будущих запросов.
+                    if score >= 7.0 {
+                        let save_result = gallery::save_photo_to_gallery(
+                            std::path::Path::new(&path),
+                            &pos, // Финальный промпт (с исправлениями)
+                            score,
+                            nsfw,
+                        )
+                        .await;
+                        match save_result {
+                            Ok(_) => {
+                                info!("[tg] generate_image: фото сохранено в gallery (score={:.1})", score);
+                            }
+                            Err(e) => {
+                                warn!("[tg] generate_image: не удалось сохранить в gallery: {e}");
+                            }
+                        }
+                    } else {
+                        info!("[tg] generate_image: фото НЕ сохранено в gallery (score={:.1} < 7.0)", score);
+                    }
+
                     // Отправляем картинку в чат.
                     client.send_photo(chat_id, &path);
-                    info!("[tg] generate_image: отправлено фото {} (попыток: {})", path, attempt + 1);
+                    info!("[tg] generate_image: отправлено фото {} (попыток: {}, score={:.1})", path, attempt + 1, score);
                     (
                         format!("Изображение сгенерировано и отправлено: {path}"),
                         vec![format!("[я отправила ФОТО (промпт): {pos}]")],
@@ -3766,6 +3810,12 @@ pub async fn run_telegram_mode(
     }
     let mut chats_requested = false;
     let mut history_requested = false;
+
+    // ── GALLERY WORKER: фоновая пре-генерация фото ───────────��──────────────
+    if cfg.capabilities.take_photo.enabled {
+        info!("[gallery] запуск фонового worker для пре-генерации фото");
+        furinya_sd::gallery_worker::spawn_gallery_worker(cfg.clone());
+    }
 
     // Новостные каналы: setup (резолв+join) один раз здесь, затем периодический
     // poll в фоне. Кэш читают fresh_news и idle-стимул; живые посты каналов
