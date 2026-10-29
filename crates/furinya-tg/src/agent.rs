@@ -3489,6 +3489,7 @@ async fn setup_news_channels(client: &TdClient, cfg: &Config) {
         if username.is_empty() {
             continue;
         }
+        debug!("[news] резолвим @{username}...");
         let extra = format!("news_setup_{idx}");
         match client
             .query_td(
@@ -3775,10 +3776,15 @@ pub async fn run_telegram_mode(
         let news_client = client.clone();
         tokio::spawn(async move {
             // После логина TDLib может ещё дожёвывать готовность — даём время.
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            poll_news_once(&news_client, 20).await;
+            // Веб-новости не зависят от TDLib — качаем их сразу, чтобы кэш
+            // наполнился до первого idle (иначе стимул пустой).
+            tokio::time::sleep(Duration::from_secs(3)).await;
             poll_web_news_once().await;
-            info!("[news] первичный опрос каналов выполнен");
+            info!("[news] веб-новости загружены (первичный опрос)");
+            // TDLib-каналы ждут дольше (нужна авторизация).
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            poll_news_once(&news_client, 20).await;
+            info!("[news] Telegram-каналы опрошены (первичный опрос)");
             let mut ticker = tokio::time::interval(Duration::from_secs(poll_secs.max(60)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Первый тик interval отдаёт сразу — он уже отработан выше,

@@ -1,0 +1,127 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "beget": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Beget AI",
+      "options": {
+        "baseURL": "https://api-llm.beget.com/v1",
+        "apiKey": "env:BEGET_API_KEY"
+      },
+      "models": {
+        "claude-fable-5.1": {
+          "name": "claude-fable-5.1",
+          "attachment": true
+        },
+        "claude-opus-5": {
+          "name": "claude-opus-5",
+          "attachment": true
+        },
+        "claude-opus-5.5": {
+          "name": "claude-opus-5.5",
+          "attachment": true
+        },
+        "claude-sonnet-5": {
+          "name": "claude-sonnet-5",
+          "attachment": true
+        },
+        "claude-sonnet-5.5": {
+          "name": "claude-sonnet-5.5",
+          "attachment": true
+        },
+        "deepseek-r1": {
+          "name": "deepseek-r1",
+          "attachment": true
+        },
+        "deepseek-v4-flash": {
+          "name": "deepseek-v4-flash",
+          "attachment": true
+        },
+        "deepseek-v4-pro": {
+          "name": "deepseek-v4-pro",
+          "attachment": true
+        },
+        "gemini-3.1-flash-lite": {
+          "name": "gemini-3.1-flash-lite",
+          "attachment": true
+        },
+        "gemini-3.1-pro": {
+          "name": "gemini-3.1-pro",
+          "attachment": true
+        },
+        "gemini-3.8-flash": {
+          "name": "gemini-3.8-flash",
+          "attachment": true
+        },
+        "glm-5.2": {
+          "name": "glm-5.2",
+          "attachment": true
+        },
+        "glm-5.3": {
+          "name": "glm-5.3",
+          "attachment": true
+        },
+        "gpt-5.6-luna": {
+          "name": "gpt-5.6-luna",
+          "attachment": true
+        },
+        "gpt-5.6-sol": {
+          "name": "gpt-5.6-sol",
+          "attachment": true
+        },
+        "gpt-6-astra": {
+          "name": "gpt-6-astra",
+          "attachment": true
+        },
+        "gpt-6-luna": {
+          "name": "gpt-6-luna",
+          "attachment": true
+        },
+        "gpt-6.1-sol": {
+          "name": "gpt-6.1-sol",
+          "attachment": true
+        },
+        "grok-4.20": {
+          "name": "grok-4.20",
+          "attachment": true
+        },
+        "grok-4.6": {
+          "name": "grok-4.6",
+          "attachment": true
+        },
+        "grok-4.7": {
+          "name": "grok-4.7",
+          "attachment": true
+        },
+        "kimi-k2.6": {
+          "name": "kimi-k2.6",
+          "attachment": true
+        },
+        "kimi-k3": {
+          "name": "kimi-k3",
+          "attachment": true
+        },
+        "llama-4-maverick": {
+          "name": "llama-4-maverick",
+          "attachment": true
+        },
+        "minimax-m3": {
+          "name": "minimax-m3",
+          "attachment": true
+        },
+        "qwen-3.7-max": {
+          "name": "qwen-3.7-max",
+          "attachment": true
+        },
+        "qwen3-coder-next": {
+          "name": "qwen3-coder-next",
+          "attachment": true
+        },
+        "qwen3.8-max": {
+          "name": "qwen3.8-max",
+          "attachment": true
+        }
+      }
+    }
+  }
+}
